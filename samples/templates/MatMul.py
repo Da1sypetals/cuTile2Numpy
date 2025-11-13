@@ -6,10 +6,10 @@ import argparse
 import cuda.tile as ct
 import torch
 from math import ceil  # Required for host-side grid calculation
-from test.kernels.matmul import matmul_kernel
+from test.kernels.matmul import matmul_kernel, persistent_matmul_kernel
 
 
-def cutile_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) -> torch.Tensor:
     """
     Performs matrix multiplication C = A @ B using a cuTile kernel with a 2D grid.
 
@@ -21,6 +21,7 @@ def cutile_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         A (torch.Tensor): The first input matrix (M x K). Must be on a CUDA device.
         B (torch.Tensor): The second input matrix (K x N). Must be on a CUDA device
                           and have its K dimension match A's K dimension.
+        persistent (bool): Whether to use the persistent kernel.
 
     Returns:
         torch.Tensor: The resulting matrix C (M x N) on the CUDA device.
@@ -61,7 +62,13 @@ def cutile_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # the entire matrix, even if dimensions are not perfect multiples of tile sizes.
     grid_x = ceil(m / tm)  # Number of blocks needed along the M dimension (rows of C)
     grid_y = ceil(n / tn)  # Number of blocks needed along the N dimension (columns of C)
-    grid = (grid_x * grid_y, 1, 1)
+    grid_size = grid_x * grid_y
+    if persistent:
+        NUM_SMS = torch.cuda.get_device_properties(
+            "cuda"
+        ).multi_processor_count
+        grid_size = min(NUM_SMS, grid_size)
+    grid = (grid_size, 1, 1)
 
     # --- Create Output Tensor C ---
     # The output tensor `C` is initialized with the correct dimensions (M x N),
@@ -71,7 +78,8 @@ def cutile_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # --- Launch the cuTile Kernel ---
     # The `matmul_kernel` is launched with the calculated grid dimensions.
     # `tm`, `tn`, and `tk` are passed as Constant integers to the kernel.
-    ct.launch(torch.cuda.current_stream(), grid, matmul_kernel, (A, B, C, tm, tn, tk))
+    kernel = persistent_matmul_kernel if persistent else matmul_kernel
+    ct.launch(torch.cuda.current_stream(), grid, kernel, (A, B, C, tm, tn, tk))
 
     return C
 
@@ -149,6 +157,18 @@ if __name__ == "__main__":
         assert torch.allclose(C_non_mult_cutile, A_non_mult @ B_non_mult, atol=1e-4), \
             "Matrix Multiplication with Dimensions Not Perfect Multiples of Tile Sizes: " \
             "Correctness check failed"
+        print("Correctness check passed")
+    else:
+        print("Correctness check disabled")
+
+    # --- Test Case 4: Persistent Matmul ---
+    print("\n--- Test Case 4: Matrix Multiplication with Persistent Matmul ---")
+    C_persistent_fp32_cutile = cutile_matmul(A_fp32, B_fp32, persistent=True)
+    print(f"cuTile Output C shape: {C_persistent_fp32_cutile.shape}, "
+          f"dtype: {C_persistent_fp32_cutile.dtype}")
+    if args.correctness_check:
+        assert torch.allclose(C_persistent_fp32_cutile, A_fp32 @ B_fp32), \
+            "Matrix Multiplication with Persistent Matmul: Correctness check failed"
         print("Correctness check passed")
     else:
         print("Correctness check disabled")

@@ -6,10 +6,12 @@ from math import ceil
 from conftest import dtype_id, shape_id
 import torch
 import pytest
-
 import cuda.tile as ct
+
 from util import estimate_bench_iter
-from kernels.matmul import matmul_kernel, matmul_split_k_kernel, batch_matmul_kernel
+from kernels.matmul import (
+    matmul_kernel, matmul_split_k_kernel, batch_matmul_kernel, persistent_matmul_kernel
+)
 
 
 @pytest.fixture(params=[
@@ -190,3 +192,29 @@ def ref_batch_matmul(bs, A, B):
     ref = torch.zeros((bs, A.shape[1], B.shape[2]), dtype=torch.float32, device="cuda")
     torch_batch_matmul(bs, A, B, ref)
     return ref
+
+
+# =============================== Persistent Matmul =============================
+
+@pytest.mark.benchmark(group='persistent_matmul')
+def bench_persistent_matmul(shape, dtype, backend, benchmark):
+    _run_matmul_benchmark(shape, dtype, backend, benchmark)
+
+
+def cutile_persistent_matmul(A, B, C):
+    NUM_SMS = torch.cuda.get_device_properties(
+            "cuda"
+        ).multi_processor_count
+    M, N = A.shape[0], B.shape[1]
+    tm, tn, tk = 256, 256, 64
+
+    grid_size = min(
+        NUM_SMS,
+        ceil(M / tm) * ceil(N / tn),
+    )
+    grid = (grid_size,)
+    ct.launch(torch.cuda.current_stream(), grid, persistent_matmul_kernel, (A, B, C, tm, tn, tk))
+
+
+def torch_persistent_matmul(A, B, C, *args):
+    torch_matmul(A, B, C)

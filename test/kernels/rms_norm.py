@@ -98,34 +98,35 @@ def rms_norm_kernel_static_persistent(
     X,  # Input tensor
     Y,  # Output tensor
     W,  # Weight tensor
-    TILE_SIZE_M: ct.Constant[int],  # 4 rows per block
-    TILE_SIZE_N: ct.Constant[int],  # columns per block
+    TILE_SIZE_M: ct.Constant[int],  # rows per tile
+    TILE_SIZE_N: ct.Constant[int],  # columns per tile
     eps: ct.Constant[float],  # Epsilon value
 ):
     """
-    CuTile static persistent RMSNorm kernel that processes multiple blocks per program.
-    Each program processes multiple blocks in a loop for better efficiency.
+    CuTile static persistent RMSNorm kernel that uses a persistent approach,
+    where NUM_SMS tile blocks are launched and each tile block processes multiple output tiles
+    for better efficiency.
     """
     # Get program ID
-    pid = ct.bid(0)
+    bid = ct.bid(0)
 
     # Infer tensor dimensions from input shape
     M = X.shape[0]  # Number of rows
     N = X.shape[1]  # Number of columns
 
-    # Calculate upper bound - number of row blocks to process
+    # Calculate upper bound
     upper_bound = (M + TILE_SIZE_M - 1) // TILE_SIZE_M
 
-    # Load weight vector once (shared across all blocks processed by this program)
+    # Load weight vector once (shared across all tiles processed by this program)
     w = ct.load(W, index=(0,), shape=(TILE_SIZE_N,))
     w = ct.astype(w, np.float32)
 
-    # Static persistent loop: each program processes multiple blocks
-    num_tiles_x = ct.num_blocks(0)
-    for current_block in range(pid, upper_bound, num_tiles_x):
+    # Static persistent loop: each  processes multiple tiles
+    num_tile_blocks = ct.num_blocks(0)
+    for current_bid in range(bid, upper_bound, num_tile_blocks):
         # Load input tile
         x = ct.load(
-            X, index=(current_block, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
+            X, index=(current_bid, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
             latency=10,  # +2% perf from this hint
         )
         x = ct.astype(x, np.float32)
@@ -164,7 +165,7 @@ def rms_norm_kernel_static_persistent(
 
         # Store result
         ct.store(
-            Y, index=(current_block, 0), tile=y,
+            Y, index=(current_bid, 0), tile=y,
             allow_tma=False,  # +30% perf
             latency=3,  # +3% perf from this hint
         )

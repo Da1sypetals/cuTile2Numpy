@@ -7,6 +7,7 @@ from conftest import dtype_id, shape_id
 import pytest
 import torch
 import cuda.tile as ct
+from math import ceil
 from util import estimate_bench_iter
 from kernels.rms_norm import (
     rms_norm_kernel, rms_norm_kernel_gather, rms_norm_kernel_static_persistent
@@ -25,10 +26,6 @@ def next_power_of_2(n: int):
     n |= n >> 32
     n += 1
     return n
-
-
-def ceil_div(a, b):
-    return (a + b - 1) // b
 
 
 @pytest.fixture(params=[
@@ -112,7 +109,7 @@ def cutile_rms_norm(x, weight, eps, static_persistent, gather):
 
         grid_size = min(
             NUM_SMS,
-            ceil_div(M, TILE_SIZE_M) * ceil_div(N, TILE_SIZE_N),
+            ceil(M / TILE_SIZE_M) * ceil(N / TILE_SIZE_N),
         )
         grid = (grid_size,)
         ct.launch(torch.cuda.current_stream(), grid, rms_norm_kernel_static_persistent, (
@@ -150,7 +147,7 @@ def _static_persistent_autotune_grid(X, TILE_SIZE_M, TILE_SIZE_N):
     M, N = X.shape[0], X.shape[1]
     grid_size = min(
         NUM_SMS,
-        ceil_div(M, TILE_SIZE_M) * ceil_div(N, TILE_SIZE_N),
+        ceil(M / TILE_SIZE_M) * ceil(N / TILE_SIZE_N),
     )
     return (grid_size,)
 
