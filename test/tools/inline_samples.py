@@ -8,7 +8,8 @@ import sys
 import pathlib
 import shutil
 import warnings
-from typing import Dict
+from typing import Dict, NamedTuple, Any
+from functools import lru_cache
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -67,28 +68,61 @@ def _used_names_in_function(fn: ast.FunctionDef) -> set[str]:
     return used
 
 
+class NodeRef(NamedTuple):
+    path: pathlib.Path | None
+    node: Any
+    seq: int  # first-seen order
+
+
+_seq = 0
+
+
+def _next_seq():
+    global _seq
+    _seq += 1
+    return _seq
+
+
+def node_ref_key(ref: NodeRef) -> tuple[str, int, int]:
+    # If the path is the same, keep the lineno order.
+    # Otherwise, keep the reversed seq order.
+    if ref.path is None:
+        return (ref.node.lineno, -ref.seq)
+    return (str(ref.path) if ref.path else "", ref.node.lineno, -ref.seq)
+
+
 def get_helper_nodes(
+    module_file: pathlib.Path,
     node: ast.FunctionDef,
     all_func_nodes: Dict[str, ast.FunctionDef],
     all_alias_nodes: Dict[str, TypeAlias | ast.Assign | ast.AnnAssign],
     all_import_nodes: Dict[str, ast.ImportFrom | ast.Import],
-    func_nodes_to_add: Dict[str, ast.FunctionDef],
-    alias_nodes_to_add: Dict[str, TypeAlias | ast.Assign | ast.AnnAssign],
-    import_nodes_to_add: Dict[str, ast.ImportFrom | ast.Import],
+    func_nodes_to_add: Dict[str, NodeRef],
+    alias_nodes_to_add: Dict[str, NodeRef],
+    import_nodes_to_add: Dict[str, NodeRef],
 ) -> None:
     used_names = _used_names_in_function(node)
     for name in used_names:
         if name in all_func_nodes:
-            func_nodes_to_add[name] = all_func_nodes[name]
+            func_nodes_to_add[name] = NodeRef(module_file, all_func_nodes[name], _next_seq())
             get_helper_nodes(
-                all_func_nodes[name],
+                module_file, all_func_nodes[name],
                 all_func_nodes, all_alias_nodes, all_import_nodes,
                 func_nodes_to_add, alias_nodes_to_add, import_nodes_to_add
             )
         elif name in all_alias_nodes:
-            alias_nodes_to_add[name] = all_alias_nodes[name]
+            alias_nodes_to_add[name] = NodeRef(module_file, all_alias_nodes[name], _next_seq())
         elif name in all_import_nodes:
-            import_nodes_to_add[name] = all_import_nodes[name]
+            imp = all_import_nodes[name]
+            if isinstance(imp, ast.ImportFrom):
+                # If `name` came from `from MOD import name` and MOD is local, open MOD and pull it.
+                imported = add_nodes_from_import_node(
+                    imp, func_nodes_to_add, alias_nodes_to_add, import_nodes_to_add
+                )
+                if not imported:
+                    import_nodes_to_add[name] = NodeRef(module_file, imp, _next_seq())
+            else:
+                import_nodes_to_add[name] = NodeRef(module_file, imp, _next_seq())
         else:
             warnings.warn(f"Unknown name: {name}, it will not be inlined to the sample.")
 
@@ -123,31 +157,75 @@ def get_all_nodes(tree: ast.Module) -> tuple:
     return all_func_nodes, all_alias_nodes, all_import_nodes
 
 
-def find_nodes_to_add(tree: ast.Module, import_names: list[str]) -> tuple:
+@lru_cache(maxsize=None)
+def _read_text(p: pathlib.Path) -> str:
+    return p.read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=None)
+def _split_lines(p: pathlib.Path) -> list[str]:
+    return _read_text(p).splitlines()
+
+
+@lru_cache(maxsize=None)
+def _parse_ast(p: pathlib.Path) -> ast.Module:
+    return ast.parse(_read_text(p))
+
+
+def find_nodes_to_add(module_file: pathlib.Path, import_names: list[str],
+                      func_nodes_to_add: Dict[str, NodeRef],
+                      alias_nodes_to_add: Dict[str, NodeRef],
+                      import_nodes_to_add: Dict[str, NodeRef]) -> None:
+    tree = _parse_ast(module_file)
     all_func_nodes, all_alias_nodes, all_import_nodes = get_all_nodes(tree)
-    func_nodes_to_add: Dict[str, ast.FunctionDef] = {}
-    alias_nodes_to_add: Dict[str, TypeAlias | ast.Assign | ast.AnnAssign] = {}
-    import_nodes_to_add: Dict[str, ast.ImportFrom | ast.Import] = {}
     for name in import_names:
         node = all_func_nodes[name]
-        func_nodes_to_add[node.name] = node
+        func_nodes_to_add[node.name] = NodeRef(module_file, node, _next_seq())
         get_helper_nodes(
-            node,
+            module_file, node,
             all_func_nodes, all_alias_nodes, all_import_nodes,
             func_nodes_to_add, alias_nodes_to_add, import_nodes_to_add
         )
-    return func_nodes_to_add, alias_nodes_to_add, import_nodes_to_add
+
+
+def _resolve_local_module_file(module: str) -> pathlib.Path | None:
+    if not module:
+        return None
+    parts = module.split(".")
+    top_module = parts[0]
+    base = KERNELS_DIR.parent if top_module == "kernels" else ROOT
+    rel = pathlib.Path(*parts).with_suffix(".py")
+    module_file = base / rel
+    if module_file.exists():
+        return module_file
+    return None
+
+
+def add_nodes_from_import_node(import_node: ast.ImportFrom,
+                               func_nodes_to_add: Dict[str, NodeRef],
+                               alias_nodes_to_add: Dict[str, NodeRef],
+                               import_nodes_to_add: Dict[str, NodeRef]) -> bool:
+    module_file = _resolve_local_module_file(import_node.module or "")
+    if module_file is None:
+        return False
+
+    find_nodes_to_add(
+        module_file, [name.name for name in import_node.names],
+        func_nodes_to_add=func_nodes_to_add,
+        alias_nodes_to_add=alias_nodes_to_add,
+        import_nodes_to_add=import_nodes_to_add,
+    )
+    return True
 
 
 def get_kernels_and_helpers_content(import_node: ast.ImportFrom, dst_tree: ast.Module) -> list[str]:
-    rel = pathlib.Path(*import_node.module.split(".")).with_suffix(".py")
-    with open(ROOT / rel, "r") as f:
-        code = f.read()
-    code_lines = code.splitlines()
-    tree = ast.parse(code)
-    func_nodes_to_add, alias_nodes_to_add, import_nodes_to_add = find_nodes_to_add(
-        tree, [name.name for name in import_node.names]
+    func_nodes_to_add: Dict[str, NodeRef] = {}
+    alias_nodes_to_add: Dict[str, NodeRef] = {}
+    import_nodes_to_add: Dict[str, NodeRef] = {}
+    imported = add_nodes_from_import_node(
+        import_node, func_nodes_to_add, alias_nodes_to_add, import_nodes_to_add
     )
+    assert imported, f"Failed to import nodes from {import_node.module}"
     _, dst_alias_nodes, dst_import_nodes = get_all_nodes(dst_tree)
     # Dedup alias and import nodes
     alias_nodes_to_add = {
@@ -158,25 +236,28 @@ def get_kernels_and_helpers_content(import_node: ast.ImportFrom, dst_tree: ast.M
     }
 
     res = []
-    # Add codes for import nodes and alias nodes
     if import_nodes_to_add:
-        for node in sorted(import_nodes_to_add.values(), key=lambda x: x.lineno):
-            res.extend(code_lines[node.lineno-1:node.end_lineno])
+        for ref in sorted(import_nodes_to_add.values(), key=node_ref_key):
+            code_lines = _split_lines(ref.path)
+            res.extend(code_lines[ref.node.lineno-1:ref.node.end_lineno])
         res.extend(["", ""])
     if alias_nodes_to_add:
-        for node in sorted(alias_nodes_to_add.values(), key=lambda x: x.lineno):
-            res.extend(code_lines[node.lineno-1:node.end_lineno])
+        for ref in sorted(alias_nodes_to_add.values(), key=node_ref_key):
+            code_lines = _split_lines(ref.path)
+            res.extend(code_lines[ref.node.lineno-1:ref.node.end_lineno])
         res.extend(["", ""])
     # Add codes for function nodes
-    for i, node in enumerate(sorted(func_nodes_to_add.values(), key=lambda x: x.lineno)):
+    # Reverse order of the function being called to make the output deterministic.
+    for i, ref in enumerate(sorted(func_nodes_to_add.values(), key=node_ref_key)):
+        code_lines = _split_lines(ref.path)
         if i > 0:
             res.extend(["", ""])
-        if len(node.decorator_list) == 1:
+        if len(ref.node.decorator_list) == 1:
             # Kernel function
-            res.extend(code_lines[node.decorator_list[0].lineno-1:node.end_lineno])
+            res.extend(code_lines[ref.node.decorator_list[0].lineno-1:ref.node.end_lineno])
         else:
             # Helper function
-            res.extend(code_lines[node.lineno-1:node.end_lineno])
+            res.extend(code_lines[ref.node.lineno-1:ref.node.end_lineno])
     return res
 
 
@@ -202,8 +283,8 @@ def replace_kernel_content(py: pathlib.Path, prefix: str) -> tuple[bool, list[st
                     node.end_lineno, get_kernels_and_helpers_content(node, tree)
                 )
     new_code_lines = []
-    if replace_map:
-        changed = True
+    changed = bool(replace_map)
+    if changed:
         i = 0
         while i < len(code_lines):
             line_no = i + 1
