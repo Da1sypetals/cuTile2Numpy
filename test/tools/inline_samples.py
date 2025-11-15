@@ -6,7 +6,6 @@ import argparse
 import ast
 import sys
 import pathlib
-import shutil
 import warnings
 from typing import Dict, NamedTuple, Any
 from functools import lru_cache
@@ -268,8 +267,11 @@ def _extend_with_empty_lines(lines: list[str]) -> None:
         lines.append("")
 
 
-def replace_kernel_content(py: pathlib.Path, prefix: str) -> tuple[bool, list[str]]:
-    """Replace the kernel import lines with the content of the imported modules."""
+def replace_kernel_content(py: pathlib.Path, prefix: str) -> list[str]:
+    """
+    Replace the kernel import lines with the content of the imported modules,
+    return the new code lines if any replaced, otherwise return the original code lines.
+    """
     with open(py, "r") as f:
         code = f.read()
     tree = ast.parse(code)
@@ -283,19 +285,34 @@ def replace_kernel_content(py: pathlib.Path, prefix: str) -> tuple[bool, list[st
                     node.end_lineno, get_kernels_and_helpers_content(node, tree)
                 )
     new_code_lines = []
-    changed = bool(replace_map)
-    if changed:
-        i = 0
-        while i < len(code_lines):
-            line_no = i + 1
-            if line_no in replace_map:
-                _extend_with_empty_lines(new_code_lines)
-                new_code_lines.extend(replace_map[line_no][1])
-                i = replace_map[line_no][0]
-            else:
-                new_code_lines.append(code_lines[i])
-                i += 1
-    return changed, new_code_lines
+    i = 0
+    while i < len(code_lines):
+        line_no = i + 1
+        if line_no in replace_map:
+            _extend_with_empty_lines(new_code_lines)
+            new_code_lines.extend(replace_map[line_no][1])
+            i = replace_map[line_no][0]
+        else:
+            new_code_lines.append(code_lines[i])
+            i += 1
+    return new_code_lines
+
+
+def _check_or_update_file(path: pathlib.Path, expected_text: str, check: bool) -> bool:
+    relative_path = path.relative_to(ROOT)
+    if check:
+        if not path.exists():
+            print(f"[inline_samples] File {relative_path} does not exist")
+            return True
+        current_text = path.read_text(encoding="utf-8")
+        if current_text != expected_text:
+            print(f"[inline_samples] File {relative_path} is out of date")
+            return True
+    else:
+        # Write mode: update the file.
+        path.write_text(expected_text, encoding="utf-8")
+        print(f"Updated {relative_path}")
+    return False
 
 
 def main():
@@ -307,23 +324,46 @@ def main():
         help="Module prefix to inline from (default: test.kernels)"
     )
     parser.add_argument("--template-dir", type=pathlib.Path, default=SAMPLES_TEMPLATES_DIR)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Do not write any files; instead, check that generated samples and "
+            "copied files are up to date. Exit with non-zero status if changes "
+            "would be made."
+        ),
+    )
+
     args = parser.parse_args()
 
+    changes_detected = False
     for py in args.template_dir.rglob("*.py"):
         if py.name == "__init__.py":
             continue
-        changed, out = replace_kernel_content(py, args.prefix)
-        if changed:
-            sample_path = SAMPLES_DIR / py.relative_to(SAMPLES_TEMPLATES_DIR)
-            sample_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-            print(f"Updated {sample_path.relative_to(ROOT)}")
+        replaced_code_lines = replace_kernel_content(py, args.prefix)
+        expected_text = "\n".join(replaced_code_lines) + "\n"
+        sample_path = SAMPLES_DIR / py.relative_to(SAMPLES_TEMPLATES_DIR)
+        if _check_or_update_file(sample_path, expected_text, args.check):
+            changes_detected = True
 
     # Copy the autotuner.py to the samples directory
     autotuner_path = ROOT / "test" / "autotuner" / "autotuner.py"
     samples_autotuner_path = SAMPLES_DIR / "utils" / "autotuner.py"
-    shutil.copy(autotuner_path, samples_autotuner_path)
-    print(f"Copied {autotuner_path.relative_to(ROOT)} to "
-          f"{samples_autotuner_path.relative_to(ROOT)}")
+    expected_autotuner_text = autotuner_path.read_text(encoding="utf-8")
+    if _check_or_update_file(samples_autotuner_path, expected_autotuner_text, args.check):
+        changes_detected = True
+
+    if args.check:
+        if changes_detected:
+            print(
+                "[inline_samples] Some files are out of date. "
+                "Run without --check to regenerate them."
+            )
+            return 1
+        else:
+            print("[inline_samples] All files are up to date.")
+
+    return 0
 
 
 if __name__ == "__main__":
