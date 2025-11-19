@@ -25,6 +25,7 @@ SAMPLES_TO_TEST = [
     "MatMul.py",
     "Transpose.py",
     "AttentionFMHA.py",
+    "LayerNorm.py",
 ]
 
 # Get the absolute path of the current directory to ensure the script
