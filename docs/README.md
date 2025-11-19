@@ -7,5 +7,6 @@ SPDX-License-Identifier: Apache-2.0
 Steps to build documentation
 
 1. Install sphinx `pip install -r requirements.txt`
-2. Run `make html`
-3. Open `build/html/index.html`
+2. In the root of this repo run `pip install -e .`
+3. In  `docs/` run `make html`
+4. Open `build/html/index.html`

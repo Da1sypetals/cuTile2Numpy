@@ -263,7 +263,7 @@ if __name__ == "__main__":
     print("--- Running cuTile Matrix Multiplication Examples (2D Grid) ---")
 
     # Define common matrix dimensions for the examples
-    M_dim = 1024
+    M_dim = 512
     N_dim = 512
     K_dim = 768
 

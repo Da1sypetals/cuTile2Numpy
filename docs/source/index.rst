@@ -37,7 +37,7 @@ latest hardware features without having to rewrite your code.
    :maxdepth: 2
    :hidden:
 
-   install
+   quickstart
    execution
    data
    memory_model
