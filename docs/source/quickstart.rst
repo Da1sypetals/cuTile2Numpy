@@ -56,7 +56,7 @@ Pytest and numpy can be installed with:
     pip install pytest numpy
 
 
-Example Code:
+Example Code
 -------------------------------------------------------------------------------
 
 The following example shows vector addition, a typical first kernel for CUDA, but uses cuTile for tile-based programming. This makes use of a 1-dimensional tile to add two 1-dimensional vectors. 
@@ -80,7 +80,7 @@ Run this from a command line as shown below. If everything has been setup correc
 
 .. code-block:: bash
 
-    $ python3 vec_add.py
+    $ python3 samples/quickstart/VectorAdd_quickstart.py
     ✓ vector_add_example passed!
 
 To run more of the cuTile Python examples, you can directly run the samples by invoking them in the same way as the quickstart example:
@@ -104,4 +104,18 @@ You can also use pytest to run all the samples:
     samples/test_samples.py ......                                  [100%]
 
     ========================= 6 passed in 30.74s ==========================
+
+Developer Tools
+-------------------------------------------------------------------------------
+
+`NVIDIA Nsight Compute <https://developer.nvidia.com/nsight-compute>`__ can profile cuTile Python kernels in the same way as SIMT CUDA kernels. With NVIDIA Nsight Compute installed, the quickstart vector addition kernel introduced here can be profiled using the following command to create a profile:
+
+.. code-block:: bash
+
+    ncu -o VecAddProfile --set detailed python3 VectorAdd_quickstart.py
+
+This profile can then be loaded in a graphical instance of Nsight Compute and the kernel ``vector_add`` selected to see statistcs about the kernel. 
+
+.. note:: 
+    Capturing detailed statistics for cuTile Python kernels require running on NVIDA Driver r590 or later.
 
