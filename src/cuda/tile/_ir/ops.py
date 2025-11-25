@@ -2849,7 +2849,7 @@ def argreduce(fn: str, x: Var, axis: Optional[int], keepdims: bool) -> Var:
 
     x_dtype = datatype.default_int_type if datatype.is_boolean(x_type.dtype) else x_type.dtype
     x = _promote_and_broadcast_to(x, TileTy(x_dtype, x_shape))
-    output_dtype = datatype.int64
+    output_dtype = datatype.default_int_type
     output_shape = TupleTy([]) if axis is None else TupleTy(x_shape[:axis] + x_shape[axis + 1:])
     x = add_operation(
         TileArgReduce, TileTy(output_dtype, output_shape),

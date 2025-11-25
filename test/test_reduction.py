@@ -344,7 +344,7 @@ argmaxmin_cases = [
 @pytest.mark.parametrize("reduce_op, torch_op", argmaxmin_cases)
 def test_reduce_argmaxmin(shape, tile, dtype, keepdims, reduce_op, torch_op):
     x = make_tensor(shape, dtype=dtype, device='cuda')
-    y = _squeezed_zeros_like(x, axis=1, keepdims=keepdims).to(torch.int64)
+    y = _squeezed_zeros_like(x, axis=1, keepdims=keepdims).to(torch.int32)
     grid = (ceil(shape[0] / tile), 1, 1)
     if len(shape) == 2:
         kernel = make_reduce_axis1_2d(reduce_op)
@@ -353,7 +353,7 @@ def test_reduce_argmaxmin(shape, tile, dtype, keepdims, reduce_op, torch_op):
         kernel = make_reduce_axis1_3d(reduce_op)
         args = (x, y, tile, shape[1], shape[2], keepdims)
     ct.launch(torch.cuda.current_stream(), grid, kernel, args)
-    ref_result = torch_op(x, dim=1, keepdim=keepdims).to(torch.int64)
+    ref_result = torch_op(x, dim=1, keepdim=keepdims).to(torch.int32)
     assert_equal(y, ref_result)
 
 
@@ -366,11 +366,11 @@ def test_reduce_argmaxmin_all_axes(shape, dtype, reduce_op, torch_op, keepdims):
     grid = (1, 1, 1)
     kernel = make_reduce_axisNone(reduce_op)
     if keepdims:
-        y = _squeezed_zeros_like(x, axis=None, keepdims=keepdims).to(torch.int64)
+        y = _squeezed_zeros_like(x, axis=None, keepdims=keepdims).to(torch.int32)
         ct.launch(torch.cuda.current_stream(), grid, kernel, (x, y, shape[0], shape[1], keepdims))
     else:
-        y = torch.zeros((1,) * len(shape), dtype=dtype, device="cuda").to(torch.int64)
+        y = torch.zeros((1,) * len(shape), dtype=dtype, device="cuda").to(torch.int32)
         ct.launch(torch.cuda.current_stream(), grid, kernel, (x, y, shape[0], shape[1], keepdims))
         y = y.squeeze()
-    ref_result = torch_op(x, dim=None, keepdim=keepdims).to(torch.int64)
+    ref_result = torch_op(x, dim=None, keepdim=keepdims).to(torch.int32)
     assert_equal(y, ref_result)
