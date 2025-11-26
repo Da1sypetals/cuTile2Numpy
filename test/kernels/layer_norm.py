@@ -39,7 +39,7 @@ def layer_norm_fwd(X, W, B, Y, Mean, Rstd, eps, TILE_N: ConstInt):
     for j in range(num_tiles):
         # Compute variance
         tx = ct.load(X, index=(bid_m, j), shape=(1, TILE_N), padding_mode=PAD_ZERO)
-        mask = (j * TILE_N + ct.arange(TILE_N, dtype=ct.int64)) < N
+        mask = (j * TILE_N + ct.arange(TILE_N, dtype=ct.int32)) < N
         centered_tx = ct.where(mask, tx - mean, 0)
         var += centered_tx ** 2
     var = ct.sum(var, axis=1) / N
@@ -63,7 +63,7 @@ def bwd_helper(X, W, DY, bid_m, j, mean, rstd, TILE_N, N):
     tdy = ct.load(DY, index=(bid_m, j), shape=(1, TILE_N), padding_mode=PAD_ZERO)
     xhat = (tx - mean) * rstd
     wdy = tw * tdy
-    mask = j * TILE_N + ct.arange(TILE_N, dtype=ct.int64) < N
+    mask = j * TILE_N + ct.arange(TILE_N, dtype=ct.int32) < N
     xhat = ct.where(mask, xhat, 0)
     wdy = ct.where(mask, wdy, 0)
     return tdy, xhat, wdy

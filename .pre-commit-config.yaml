@@ -16,10 +16,6 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-commit, pre-push]
-        files: |
-            ^samples/templates/|
-            ^samples/|
-            ^test/kernels/
-            ^test/autotuner/autotuner.py
+        files: ^samples/|^test/kernels/|^test/autotuner/autotuner.py
         always_run: false
         require_serial: true
