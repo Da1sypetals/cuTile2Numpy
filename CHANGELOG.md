@@ -4,3 +4,4 @@
 # This file tracks changes in between releases
 
 - Improve error message for `ct.cat()` - by @Da1sypetals
+- Fix SliceType __eq__ comparison logic (by @Navneetpandit7226)
