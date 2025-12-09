@@ -5,78 +5,20 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable, Callable, Sequence
 
-import functools
-from typing import Callable, Sequence
 import cuda.tile as ct
 from cuda.tile._execution import TileDispatcher
 from cuda.tile._exception import TileCompilerTimeoutError, TileCompilerExecutionError
 from cuda.tile._cext import default_tile_context
 import random
 import torch
-import inspect
 import logging
 
 
 logger = logging.getLogger(__name__)
 
-
-class Config:
-    """One kernel variant: meta-params in kwargs (e.g., TILE)."""
-    def __init__(self, *, num_ctas=None, occupancy=None, opt_level=3, **kwargs):
-        self.kwargs = dict(kwargs)
-        self.num_ctas = num_ctas
-        self.occupancy = occupancy
-        self.opt_level = opt_level
-
-    def __getattr__(self, name):
-        if name in self.kwargs:
-            return self.kwargs[name]
-        raise AttributeError(f"Attribute {name} not found in {self.kwargs}")
-
-    def __str__(self):
-        res = []
-        for k, v in self.kwargs.items():
-            res.append(f"{k}={v}")
-        res.append(f"num_ctas={self.num_ctas}")
-        res.append(f"occupancy={self.occupancy}")
-        res.append(f"opt_level={self.opt_level}")
-        return f"Config({', '.join(res)})"
-
-
-class SearchSpace:
-    def __init__(self, configs: list[Config], predicate_fn: Callable | None = None):
-        if len(configs) <= 1:
-            raise ValueError(
-                "At least two configurations in the search space are required for autotuning"
-            )
-        self.kwargs_keys = set(configs[0].kwargs.keys())
-        for config in configs[1:]:
-            if set(config.kwargs.keys()) != self.kwargs_keys:
-                raise ValueError(
-                    "All configurations must have the same set of keyword arguments"
-                )
-        self.configs = configs
-        self.predicate_fn = predicate_fn
-
-    def __iter__(self):
-        return iter(self.configs)
-
-    def __len__(self):
-        return len(self.configs)
-
-    def __getitem__(self, index):
-        return self.configs[index]
-
-    def filter(self, named_args: dict[str, Any], cfg: Config) -> bool:
-        if self.predicate_fn is None:
-            return True
-        result = self.predicate_fn(named_args, cfg)
-        if not isinstance(result, bool):
-            raise TypeError(f"Predicate function {self.predicate_fn.__name__} must return "
-                            f"a boolean value, but returned {type(result).__name__} instead.")
-        return result
+_MAX_SEARCH_ITEMS = 10_000  # safety cap for very large / infinite streams
 
 
 def _shape_dtype_stride(arg: Any) -> tuple[tuple[int, ...], str, tuple[int, ...] | None]:
@@ -93,11 +35,10 @@ def _shape_dtype_stride(arg: Any) -> tuple[tuple[int, ...], str, tuple[int, ...]
     return shape, dtype, stride
 
 
-def _default_key(kernel: TileDispatcher, args: tuple[Any, ...]):
+def _default_key(args: tuple[Any, ...]):
     """Default cache key for autotune.
-    The key(for now) is a tuple of:
-    - kernel function name
-    - tuple of (shape, dtype, stride) for each argument in the runtime argument (tensor),
+    The key(for now) is:
+    - a tuple of (shape, dtype, stride) for each argument in the runtime argument (tensor),
     - or its type name for each argument in the runtime argument (other types).
     """
     tinfo = []
@@ -107,7 +48,7 @@ def _default_key(kernel: TileDispatcher, args: tuple[Any, ...]):
             tinfo.append((shape, dtype, stride))
         else:
             tinfo.append(type(arg).__name__)
-    return (kernel._pyfunc.__name__, tuple(tinfo))
+    return tuple(tinfo)
 
 
 def _time_ms(run_once, *, get_args, stream, warmup=2, rep=10):
@@ -132,54 +73,61 @@ def _time_ms(run_once, *, get_args, stream, warmup=2, rep=10):
 
 @dataclass
 class TunedResult:
-    # The tuned parameters
-    tuned_params: dict[str, Any]
+    # The tuned config
+    tuned_config: Any
     # The grid to be used for launching the kernel
     grid: tuple[int, ...]
     # The updated tile dispatcher to be used for launching the kernel
     kernel: TileDispatcher
-    num_ctas: int
-    occupancy: int
-    opt_level: int
-
-    def __getattr__(self, name):
-        if name in self.tuned_params:
-            return self.tuned_params[name]
-        raise AttributeError(f"Attribute {name} not found in {self.tuned_params}")
+    # The tuning record: per-config timings from this tuning run
+    tuning_record: Sequence[tuple[Any, float]]
+    # Whether this result came from cache(True) or from a new tuning run(False)
+    cache_hit: bool
 
 
-def _make_trial_args(
-    args_fn: Callable[[Config], tuple[Any, ...]],
-    cfg: Config,
-    kernel: TileDispatcher,
-    transforms: dict[str, Callable[[Any], Any]]
-) -> tuple[dict[str, Any], tuple[Any, ...]]:
-    """Make trial runtime arguments applying the transforms."""
-    args = args_fn(cfg)
+@dataclass
+class _CacheEntry:
+    best_cfg: Any
+    best_grid: tuple[int, ...]
+    best_kernel: TileDispatcher
+    tuning_record: Sequence[tuple[Any, float]]
 
-    trial_named_args = {}
-    trial_args = []
-    kernel_sig = inspect.signature(kernel._pyfunc)
-    for kernel_key, arg in zip(kernel_sig.parameters.keys(), args, strict=True):
-        if kernel_key in transforms:
-            trial_named_args[kernel_key] = transforms[kernel_key](arg)
+
+# Two-level cache:
+#   outer: kernel key (e.g., kernel._pyfunc)
+#   inner: _default_key or user-provided key
+_autotuned_cache: dict[Any, dict[Any, _CacheEntry]] = {}
+
+
+def clear_cache(*, kernel: TileDispatcher | None = None, key: Any | None = None):
+    """Clear entries from the autotuner cache.
+
+    The cache is organized as a two-level mapping:
+    {kernel_key -> {arg_key -> _CacheEntry}}
+
+    Args:
+        kernel:
+            If provided, restricts clearing to this kernel's cache only.
+            If ``None``, the operation applies to all kernels.
+        key:
+            If provided, restricts clearing to this argument key.
+            If ``None``, all keys at the selected level are cleared.
+    """
+    if kernel is None:
+        if key is None:
+            _autotuned_cache.clear()
         else:
-            trial_named_args[kernel_key] = arg
-        trial_args.append(trial_named_args[kernel_key])
-    return trial_named_args, tuple(trial_args)
-
-
-def _normalize_search_space(space: SearchSpace | Sequence[Config]) -> SearchSpace:
-    if isinstance(space, SearchSpace):
-        return space
-
-    # Allow sequence of Configs
-    if isinstance(space, Sequence) and all(isinstance(c, Config) for c in space):
-        return SearchSpace(list(space))
-
-    raise TypeError(
-        "search_space must be a SearchSpace, or a sequence of Configs"
-    )
+            for per_kernel in _autotuned_cache.values():
+                per_kernel.pop(key, None)
+    else:
+        kernel_key = kernel._pyfunc
+        per_kernel = _autotuned_cache.get(kernel_key)
+        if per_kernel is None:
+            return
+        if key is None:
+            per_kernel.clear()
+        else:
+            per_kernel.pop(key, None)
 
 
 @contextmanager
@@ -192,155 +140,203 @@ def compiler_timeout(timeout_sec: int):
         default_tile_context.config.compiler_timeout_sec = old_timeout
 
 
-class Autotuner:
-    def __init__(self, search_space: SearchSpace | Sequence[Config]):
-        self._search_space = _normalize_search_space(search_space)
-        self._cache = {}
+def _reservoir_sample(
+    iterable: Iterable[Any],
+    k: int,
+    *,
+    rng: random.Random,
+    max_items: int,
+) -> list[Any]:
+    """Uniformly sample up to k items from an iterable using reservoir sampling.
 
-    def clear_cache(self, key=None):
-        if key is None:
-            self._cache.clear()
+    The sample is limited to the first max_items items.
+    """
+    reservoir: list[Any] = []
+    n_seen = 0
+
+    for item in iterable:
+        n_seen += 1
+        if n_seen > max_items:
+            break
+        if len(reservoir) < k:
+            reservoir.append(item)
         else:
-            self._cache.pop(key, None)
+            j = rng.randint(0, n_seen - 1)
+            if j < k:
+                reservoir[j] = item
+    return reservoir
 
-    def __call__(self,
-                 stream, grid_fn, kernel,
-                 args_fn: Callable[[Config], tuple[Any, ...]],
-                 transforms: dict[str, Callable] = {},
-                 *,
-                 key_fn=_default_key,
-                 max_iter: int = 60,
-                 compiler_time_limit_sec: int = 10,
-                 seed: int | None = None,
-                 force_retune: bool = False) -> TunedResult:
-        """
-        Run the autotuned kernel and return its result.
 
-        It performs the following steps:
-        1) picks a configuration from the search space or reuses the cached
-           best configuration for the given key (unless ``force_retune=True``),
-        2) launches the kernel with the best configuration,
-        3) returns the tuned result.
+def autotune_launch(stream, grid_fn, kernel,
+                    args_fn: Callable[[Any], tuple[Any, ...]],
+                    launch_args_fn: Callable[[Any], tuple[Any, ...]] | None = None,
+                    hints_fn: Callable[[Any], dict[str, Any]] | None = None,
+                    *,
+                    search_space: Iterable[Any] | Callable[[], Iterable[Any]],
+                    key: Any | None = None,
+                    max_iter: int = 60,
+                    compiler_time_limit_sec: int = 10,
+                    seed: int | None = None,
+                    force_retune: bool = False) -> TunedResult:
+    """
+    Run the autotuned kernel and return its result.
 
-        Args:
-            stream:
-                CUDA stream to use for all kernel launches during tuning and
-                for the final run.
-            grid_fn:
-                Callable that takes the named arguments and a single
-                positional :class:`Config` object and returns a tuple of grid
-                dimensions.
-            kernel:
-                The kernel to autotune.
-            args_fn:
-                Callable that takes a single positional :class:`Config` and
-                returns a tuple of runtime arguments for ``kernel``.
-            transforms:
-                Optional transform or sequence of transforms applied to the
-                runtime arguments before each kernel launch. Use this to
-                perform lightweight pre-/post-processing without changing
-                the search space.
-            key_fn:
-                Optional function that maps the named arguments to a hashable
-                cache key. When omitted, a default key derived from argument
-                shapes/dtypes is used. The key is used to look up and store
-                the best config in the autotuner cache.
-            max_iter:
-                Maximum number of (valid) configurations to sample from the
-                search space.
-            compiler_time_limit_sec:
-                The compilation time limit for each kernel.
-            seed:
-                Optional seed for the random number generator used when
-                sampling configurations. If ``None``, the global random number
-                generator state is used.
-            force_retune:
-                If ``True``, ignore any cached best config for this key and
-                re-run the search. The new best config is then written back
-                to the cache.
-        """
-        key = key_fn(kernel, args_fn(self._search_space.configs[0]))
-        if not force_retune and key in self._cache:
-            best_idx, best_grid, best_kernel = self._cache[key]
-            logger.debug(f"Using cached config for key {key}: {self._search_space[best_idx]}")
-        else:
-            rng = random.Random(seed)
-            indices = rng.sample(range(len(self._search_space)), len(self._search_space))
-            best_time_ms, best_idx, best_kernel = float("inf"), None, None
-            successes = 0
-            for cfg_idx in indices:
-                if successes >= max_iter:
-                    break
-                cfg = self._search_space[cfg_idx]
-                trial_named_args, trial_args = _make_trial_args(
-                    args_fn, cfg, kernel, transforms
-                )
-                if not self._search_space.filter(trial_named_args, cfg):
-                    logger.debug(f"Config {cfg} filtered out by predicate function")
-                    continue
+    It performs the following steps:
+    1) picks a configuration from the search space or reuses the cached
+        best configuration for the given (kernel, key) pair (unless ``force_retune=True``),
+    2) launches the kernel with the best configuration,
+    3) returns the tuned result.
 
-                grid = grid_fn(trial_named_args, cfg)
-                updated_kernel = ct.kernel(
-                    kernel._pyfunc,
-                    num_ctas=cfg.num_ctas,
-                    occupancy=cfg.occupancy,
-                    opt_level=cfg.opt_level
-                )
+    The autotuner uses a two-level cache:
+        - outer: kernel key (``kernel._pyfunc``)
+        - inner: arg key (either the value of ``key`` if provided,
+           or the result of ``_default_key`` based on the runtime arguments)
 
-                def run_once(args):
-                    ct.launch(stream, grid, updated_kernel, args)
+    If both keys hit an entry in the cache, the cached config is reused. To force a new
+    tuning run in this case, you can:
+      - set ``force_retune=True``, or
+      - clear the cache entry with ``clear_cache(kernel=kernel, key=key)``.
 
-                try:
-                    with compiler_timeout(compiler_time_limit_sec):
-                        time_ms = _time_ms(
-                            run_once,
-                            get_args=lambda: _make_trial_args(args_fn, cfg, kernel, transforms)[1], # noqa
-                            stream=stream,
-                        )
-                except TileCompilerTimeoutError as e:
-                    logger.debug(f"{cfg} compilation timeout: {e}")
-                    continue
-                except TileCompilerExecutionError as e:
-                    logger.debug(f"{cfg} compilation error: {e}")
-                    continue
+    In particular, if you change the seach space but reuses the same key, by default the
+    autotuner will continue to reuse the cached config. In that case, you may want to explicitly
+    rerun the tuning as mentioned above.
 
-                if time_ms < best_time_ms:
-                    best_time_ms = time_ms
-                    best_idx, best_grid, best_kernel = cfg_idx, grid, updated_kernel
-                    logger.debug(
-                        f"Iteration {successes} updated best config to {cfg}: {best_time_ms} ms"
+    Args:
+        stream:
+            CUDA stream to use for all kernel launches during tuning and
+            for the final run.
+        grid_fn:
+            Callable that takes the named arguments and a single
+            positional config object and returns a tuple of grid
+            dimensions.
+        kernel:
+            The kernel to autotune.
+        args_fn:
+            Callable that takes a single positional config object and
+            returns a tuple of runtime arguments for ``kernel`` to be passed to
+            tuning.
+        launch_args_fn:
+            Callable that takes a single positional config object and
+            returns a tuple of runtime arguments for ``kernel`` to be passed to
+            ``ct.launch``.
+        hints_fn:
+            Callable that takes a single positional config object and
+            returns a dictionary of hints to be used for tuning.
+        search_space:
+            Iterable of config objects to sample from or a callable that
+            returns an iterable of config objects to sample from when called.
+        key:
+            Optional hashable key to use for caching the best config.
+            If ``None``, the default key is used.
+            The default key is a tuple of (shape, dtype, stride) for each argument
+            in the runtime argument (tensor), or its type name for each argument
+            in the runtime argument (other types).
+        max_iter:
+            Maximum number of (valid) configurations to sample from the
+            search space.
+        compiler_time_limit_sec:
+            The compilation time limit for each kernel.
+        seed:
+            Optional seed for the random number generator used when
+            sampling configurations. If ``None``, the global random number
+            generator state is used.
+        force_retune:
+            If ``True``, ignore any cached best config for this key and
+            re-run the search. The new best config is then written back
+            to the cache.
+    """
+    if callable(search_space):
+        search_space = search_space()
+
+    rng = random.Random(seed)
+    search_space = _reservoir_sample(
+        search_space,
+        k=max_iter,
+        rng=rng,
+        max_items=_MAX_SEARCH_ITEMS,
+    )
+    if len(search_space) == 0:
+        raise ValueError("Search space must contain at least 1 configuration")
+
+    kernel_key = kernel._pyfunc
+    per_kernel = _autotuned_cache.get(kernel_key)
+    if per_kernel is None:
+        per_kernel = {}
+        _autotuned_cache[kernel_key] = per_kernel
+    # _default_key is in the critical path for launch, it can add some overhead.
+    if key is None:
+        arg_key = _default_key(args_fn(search_space[0]))
+    else:
+        arg_key = key
+
+    tuning_entries: list[tuple[Any, float]] = []
+    cache_hit = False
+
+    if not force_retune and arg_key in per_kernel:
+        logger.debug(f"Using cached config for key {key}")
+        cache_hit = True
+    else:
+        indices = list(range(len(search_space)))
+        rng.shuffle(indices)
+
+        best_time_ms, best_cfg, best_kernel = float("inf"), None, None
+        for i, cfg_idx in enumerate(indices):
+            cfg = search_space[cfg_idx]
+
+            grid = grid_fn(cfg)
+            hints = hints_fn(cfg) if hints_fn else {}
+            updated_kernel = ct.kernel(
+                kernel._pyfunc,
+                **hints
+            )
+
+            def run_once(args):
+                ct.launch(stream, grid, updated_kernel, args)
+
+            try:
+                with compiler_timeout(compiler_time_limit_sec):
+                    time_ms = _time_ms(
+                        run_once,
+                        get_args=lambda: args_fn(cfg), # noqa
+                        stream=stream,
                     )
-                successes += 1
+            except TileCompilerTimeoutError as e:
+                logger.debug(f"{cfg} compilation timeout: {e}")
+                continue
+            except TileCompilerExecutionError as e:
+                logger.debug(f"{cfg} compilation error: {e}")
+                continue
 
-            # Save the best config and kernel.
-            if best_idx is None:
-                raise ValueError("No valid config found")
-            self._cache[key] = (best_idx, best_grid, best_kernel)
+            if time_ms < best_time_ms:
+                best_time_ms = time_ms
+                best_cfg, best_grid, best_kernel = cfg, grid, updated_kernel
+                logger.debug(
+                    f"Iteration {i} updated best config to {cfg}: {best_time_ms} ms"
+                )
+            # Record the tuning result
+            tuning_entries.append((cfg, time_ms))
 
-        best_cfg = self._search_space[best_idx]
+        # Save the best config and kernel.
+        if best_cfg is None:
+            raise ValueError("No valid config found")
+        per_kernel[arg_key] = _CacheEntry(best_cfg, best_grid, best_kernel, tuning_entries)
 
-        # Use the original runtime arguments to run the kernel with the best config
-        best_packed_args = args_fn(best_cfg)
-        ct.launch(stream, best_grid, best_kernel, best_packed_args)
+    # Lanunch the kernel with the best config
+    cache_entry = per_kernel[arg_key]
 
-        # Return the tuned result
-        return TunedResult(best_cfg.kwargs, best_grid, best_kernel,
-                           num_ctas=best_cfg.num_ctas,
-                           occupancy=best_cfg.occupancy,
-                           opt_level=best_cfg.opt_level)
+    # Use the original runtime arguments to run the kernel with the best config
+    best_args = (
+        launch_args_fn(cache_entry.best_cfg)
+        if launch_args_fn
+        else args_fn(cache_entry.best_cfg)
+    )
+    ct.launch(stream, cache_entry.best_grid, cache_entry.best_kernel, best_args)
 
-
-def autotune(search_space):
-
-    def decorator(func):
-        tuner = Autotuner(search_space)   # single, device-agnostic instance
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # Inject the tuner into the function arguments
-            kwargs.setdefault("autotuner", tuner)
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
+    # Return the tuned result
+    return TunedResult(
+        tuned_config=cache_entry.best_cfg,
+        grid=cache_entry.best_grid,
+        kernel=cache_entry.best_kernel,
+        tuning_record=cache_entry.tuning_record,
+        cache_hit=cache_hit
+    )
