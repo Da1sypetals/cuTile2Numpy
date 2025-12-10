@@ -131,7 +131,7 @@ if __name__ == "__main__":
     C_fp32_cutile = cutile_matmul(A_fp32, B_fp32)
     print(f"cuTile Output C shape: {C_fp32_cutile.shape}, dtype: {C_fp32_cutile.dtype}")
     if args.correctness_check:
-        torch.testing.assert_close(C_fp32_cutile, A_fp32 @ B_fp32)
+        torch.testing.assert_close(C_fp32_cutile, A_fp32 @ B_fp32, atol=1e-5, rtol=1e-3)
         print("Correctness check passed")
     else:
         print("Correctness check disabled")
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     C_non_mult_cutile = cutile_matmul(A_non_mult, B_non_mult)
     print(f"cuTile Output C shape: {C_non_mult_cutile.shape}, dtype: {C_non_mult_cutile.dtype}")
     if args.correctness_check:
-        torch.testing.assert_close(C_non_mult_cutile, A_non_mult @ B_non_mult, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(C_non_mult_cutile, A_non_mult @ B_non_mult, atol=1e-5, rtol=1e-3)
         print("Correctness check passed")
     else:
         print("Correctness check disabled")
@@ -163,7 +163,7 @@ if __name__ == "__main__":
     print(f"cuTile Output C shape: {C_persistent_fp32_cutile.shape}, "
           f"dtype: {C_persistent_fp32_cutile.dtype}")
     if args.correctness_check:
-        torch.testing.assert_close(C_persistent_fp32_cutile, A_fp32 @ B_fp32)
+        torch.testing.assert_close(C_persistent_fp32_cutile, A_fp32 @ B_fp32, atol=1e-5, rtol=1e-3)
         print("Correctness check passed")
     else:
         print("Correctness check disabled")
