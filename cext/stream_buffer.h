@@ -28,15 +28,16 @@ class StreamBufferTransaction {
 public:
     StreamBufferTransaction() = default;
 
-    StreamBufferTransaction(StreamBufferPool* pool, StreamBuffer* sb, CUstream stream)
-        : pool_(pool), sb_(sb), stream_(stream)
+    StreamBufferTransaction(StreamBufferPool* pool, StreamBuffer* sb, CUstream stream,
+            const DriverApi* driver)
+        : pool_(pool), sb_(sb), stream_(stream), driver_(driver)
     {}
 
     StreamBufferTransaction(const StreamBufferTransaction&) = delete;
     void operator= (const StreamBufferTransaction&) = delete;
 
     StreamBufferTransaction(StreamBufferTransaction&& other)
-        : pool_(other.pool_), sb_(other.sb_), stream_(other.stream_)
+        : pool_(other.pool_), sb_(other.sb_), stream_(other.stream_), driver_(other.driver_)
     {
         other.pool_ = nullptr;
         other.sb_ = nullptr;
@@ -49,6 +50,7 @@ public:
             pool_ = other.pool_;
             sb_ = other.sb_;
             stream_ = other.stream_;
+            driver_ = other.driver_;
             other.pool_ = nullptr;
             other.sb_ = nullptr;
             other.stream_ = nullptr;
@@ -68,9 +70,12 @@ private:
     StreamBufferPool* pool_ = nullptr;
     StreamBuffer* sb_ = nullptr;
     CUstream stream_ = {};
+    const DriverApi* driver_ = nullptr;
 };
 
 StreamBufferPool* stream_buffer_pool_new();
 
-StreamBufferTransaction stream_buffer_transaction_open(StreamBufferPool* pool, CUstream stream);
+StreamBufferTransaction stream_buffer_transaction_open(const DriverApi*,
+                                                       StreamBufferPool* pool,
+                                                       CUstream stream);
 

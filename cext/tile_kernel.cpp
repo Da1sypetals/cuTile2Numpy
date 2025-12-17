@@ -97,9 +97,9 @@ static_assert(sizeof(ArraySpecializationBits) == 8);
 // RAII wrapper around CUlibrary
 namespace { class CudaLibrary {
 public:
-    explicit CudaLibrary(CUlibrary lib) : lib_(lib) {}
+    explicit CudaLibrary(const DriverApi* driver, CUlibrary lib) : driver_(driver), lib_(lib) {}
 
-    CudaLibrary(CudaLibrary&& other) : lib_(other.lib_) {
+    CudaLibrary(CudaLibrary&& other) : driver_(other.driver_), lib_(other.lib_) {
         other.lib_ = nullptr;
     }
 
@@ -108,7 +108,7 @@ public:
 
     ~CudaLibrary() {
         if (lib_) {
-            CUresult res = g_cuLibraryUnload(lib_);
+            CUresult res = driver_->cuLibraryUnload(lib_);
             CHECK(res == CUDA_SUCCESS);
         }
     }
@@ -118,18 +118,19 @@ public:
     }
 
 private:
+    const DriverApi* driver_;
     CUlibrary lib_;
 }; }
 
-static Result<CudaLibrary> load_cuda_library(const char* filename) {
+static Result<CudaLibrary> load_cuda_library(const DriverApi* driver, const char* filename) {
     CUlibrary lib;
-    CUresult res = g_cuLibraryLoadFromFile(&lib, filename, nullptr, nullptr, 0,
+    CUresult res = driver->cuLibraryLoadFromFile(&lib, filename, nullptr, nullptr, 0,
                                            nullptr, nullptr, 0);
     if (res == CUDA_SUCCESS)
-        return CudaLibrary(lib);
+        return CudaLibrary(driver, lib);
 
     return raise(PyExc_RuntimeError, "Failed to load CUDA library from %s: %s",
-                 filename, get_cuda_error(res));
+                 filename, get_cuda_error(driver, res));
 }
 
 struct CudaKernel {
@@ -137,17 +138,19 @@ struct CudaKernel {
     CUkernel kernel;
 };
 
-static Result<CudaKernel> load_cuda_kernel(const char* filename, const char* func_name) {
-    Result<CudaLibrary> lib = load_cuda_library(filename);
+static Result<CudaKernel> load_cuda_kernel(const DriverApi* driver,
+                                           const char* filename,
+                                           const char* func_name) {
+    Result<CudaLibrary> lib = load_cuda_library(driver, filename);
     if (!lib.is_ok()) return ErrorRaised;
 
     CUkernel kernel;
-    CUresult res = g_cuLibraryGetKernel(&kernel, lib->get(), func_name);
+    CUresult res = driver->cuLibraryGetKernel(&kernel, lib->get(), func_name);
     if (res == CUDA_SUCCESS)
         return CudaKernel{std::move(*lib), kernel};
 
     return raise(PyExc_RuntimeError, "Failed to get kernel %s from library %s: %s",
-                 func_name, filename, get_cuda_error(res));
+                 func_name, filename, get_cuda_error(driver, res));
 }
 
 
@@ -444,7 +447,8 @@ static ArraySpecializationBits compute_array_specialization_bits(
     return ret;
 }
 
-static void extract_array_specialization_constants(ArrayType arrtype,
+static void extract_array_specialization_constants(const DriverApi* driver,
+                                                   ArrayType arrtype,
                                                    const Word* array_repr,
                                                    size_t num_arrays,
                                                    LaunchHelper& helper) {
@@ -453,8 +457,8 @@ static void extract_array_specialization_constants(ArrayType arrtype,
 
     if (!helper.cuda_context) {
         void* first_data_ptr = array_repr[0].device_ptr;
-        g_cuPointerGetAttribute(&helper.cuda_context, CU_POINTER_ATTRIBUTE_CONTEXT,
-                                reinterpret_cast<CUdeviceptr>(first_data_ptr));
+        driver->cuPointerGetAttribute(&helper.cuda_context, CU_POINTER_ATTRIBUTE_CONTEXT,
+                reinterpret_cast<CUdeviceptr>(first_data_ptr));
     }
 
     uint64_t special_bits = ~static_cast<uint64_t>(0);
@@ -730,7 +734,7 @@ typedef Status(*ArrayReprFunc)(PyObject*, Vec<Word>&, ArrayType&);
 
 
 template <ArrayReprFunc F>
-static Status extract_array(PyObject* pyobj, LaunchHelper& helper) {
+static Status extract_array(const DriverApi* driver, PyObject* pyobj, LaunchHelper& helper) {
     size_t offset = helper.cuargs.size();
 
     ArrayType arrtype;
@@ -738,7 +742,7 @@ static Status extract_array(PyObject* pyobj, LaunchHelper& helper) {
         return ErrorRaised;
 
     CHECK(helper.cuargs.size() == offset + 1 + 2 * arrtype.ndim);
-    extract_array_specialization_constants(arrtype, &helper.cuargs[offset], 1, helper);
+    extract_array_specialization_constants(driver, arrtype, &helper.cuargs[offset], 1, helper);
     return OK;
 }
 
@@ -795,7 +799,7 @@ static Status get_array_repr(PythonArgKind kind, PyObject* pyobj, Vec<Word>& dst
     }
 }
 
-static Status extract_py_list(PyObject* pyobj, LaunchHelper& helper) {
+static Status extract_py_list(const DriverApi* driver, PyObject* pyobj, LaunchHelper& helper) {
     size_t len = PyList_GET_SIZE(pyobj);
     if (len > INT32_MAX)
         return raise(PyExc_TypeError, "List is too long");
@@ -854,12 +858,14 @@ static Status extract_py_list(PyObject* pyobj, LaunchHelper& helper) {
     // TODO: If we accept lists of things other than arrays, then to disambiguate,
     //       we need to push another constant here that specifies the type of the list element .
     CHECK(helper.nested_arrays.size() == offset + len * (1 + 2 * first_arrtype.ndim));
-    extract_array_specialization_constants(first_arrtype, &helper.nested_arrays[offset], len,
+    extract_array_specialization_constants(driver, first_arrtype,
+                                           &helper.nested_arrays[offset], len,
                                            helper);
     return OK;
 }
 
-static Status extract_cuda_args(PyObject* const* pyargs, size_t num_pyargs,
+static Status extract_cuda_args(const DriverApi* driver,
+                                PyObject* const* pyargs, size_t num_pyargs,
                                 const Vec<PythonArgKind>& arg_kinds,
                                 const Vec<bool>& constant_arg_flags,
                                 LaunchHelper& helper) {
@@ -875,15 +881,15 @@ static Status extract_cuda_args(PyObject* const* pyargs, size_t num_pyargs,
 
         switch (arg_kinds[i]) {
         case PythonArgKind::TorchTensorDlpack:
-            if (!extract_array<arrayrepr_torch_tensor_dlpack>(pyobj, helper))
+            if (!extract_array<arrayrepr_torch_tensor_dlpack>(driver, pyobj, helper))
                 return ErrorRaised;
             break;
         case PythonArgKind::DlpackArray:
-            if (!extract_array<arrayrepr_dlpack>(pyobj, helper))
+            if (!extract_array<arrayrepr_dlpack>(driver, pyobj, helper))
                 return ErrorRaised;
             break;
         case PythonArgKind::CudaArray:
-            if (!extract_array<arrayrepr_cuda_array_iface>(pyobj, helper))
+            if (!extract_array<arrayrepr_cuda_array_iface>(driver, pyobj, helper))
                 return ErrorRaised;
             break;
         case PythonArgKind::PyLong:
@@ -893,7 +899,7 @@ static Status extract_cuda_args(PyObject* const* pyargs, size_t num_pyargs,
             extract_py_float(pyobj, is_constant, helper);
             break;
         case PythonArgKind::PyList:
-            if (!extract_py_list(pyobj, helper)) return ErrorRaised;
+            if (!extract_py_list(driver, pyobj, helper)) return ErrorRaised;
             break;
         }
     }
@@ -943,7 +949,8 @@ static void get_pyarg_types(PyObject* const* pyargs, Py_ssize_t num_pyargs,
         pyarg_types.push_back(Py_TYPE(pyargs[i]));
 }
 
-static Result<TileKernel> compile(TileDispatcher& dispatcher,
+static Result<TileKernel> compile(const DriverApi* driver,
+                                  TileDispatcher& dispatcher,
                                   PyObject* const* pyargs,
                                   Py_ssize_t num_pyargs,
                                   PyObject* py_tile_context) {
@@ -981,7 +988,7 @@ static Result<TileKernel> compile(TileDispatcher& dispatcher,
     const char* cufunc_name = PyUnicode_AsUTF8(py_cufunc_name);
     if (!cufunc_name) return ErrorRaised;
 
-    Result<CudaKernel> cukernel = load_cuda_kernel(cubin_filename, cufunc_name);
+    Result<CudaKernel> cukernel = load_cuda_kernel(driver, cubin_filename, cufunc_name);
     if (!cukernel.is_ok()) return ErrorRaised;
 
     return TileKernel{std::move(*cukernel)};
@@ -1052,19 +1059,20 @@ using StreamBufferPoolMap = HashMap<unsigned long long, StreamBufferPool*>;
 static StreamBufferPoolMap* g_stream_buffer_pool_by_ctx_id;
 
 
-static Result<StreamBufferPool*> get_stream_buffer_pool(CUcontext ctx) {
+static Result<StreamBufferPool*> get_stream_buffer_pool(const DriverApi* driver, CUcontext ctx) {
     if (!ctx) {
-        CUresult res = g_cuCtxGetCurrent(&ctx);
+        CUresult res = driver->cuCtxGetCurrent(&ctx);
         if (res != CUDA_SUCCESS) {
             return raise(PyExc_RuntimeError, "Failed to get current CUDA context: %s",
-                         get_cuda_error(res));
+                         get_cuda_error(driver, res));
         }
     }
 
     unsigned long long ctx_id = 0;
-    CUresult res = g_cuCtxGetId(ctx, &ctx_id);
+    CUresult res = driver->cuCtxGetId(ctx, &ctx_id);
     if (res != CUDA_SUCCESS)
-        return raise(PyExc_RuntimeError, "Failed to get CUDA context ID: %s", get_cuda_error(res));
+        return raise(PyExc_RuntimeError,
+                     "Failed to get CUDA context ID: %s", get_cuda_error(driver, res));
 
     StreamBufferPool** pp = g_stream_buffer_pool_by_ctx_id->find(ctx_id);
     if (pp) {
@@ -1078,37 +1086,39 @@ static Result<StreamBufferPool*> get_stream_buffer_pool(CUcontext ctx) {
 
 namespace { struct ContextGuard {
     bool need_to_pop;
+    const DriverApi* driver_;
 
-    ContextGuard() : need_to_pop(false) {}
+    ContextGuard(const DriverApi* driver) : need_to_pop(false), driver_(driver) {}
 
+    ContextGuard() = delete;
     ContextGuard(const ContextGuard&) = delete;
     void operator=(const ContextGuard&) = delete;
 
     ~ContextGuard() {
         if (need_to_pop) {
             CUcontext old;
-            CUresult res = g_cuCtxPopCurrent(&old);
+            CUresult res = driver_->cuCtxPopCurrent(&old);
             CHECK(res == CUDA_SUCCESS);
         }
     }
 }; }
 
-static Status maybe_switch_context(CUcontext target, ContextGuard& guard) {
+static Status maybe_switch_context(const DriverApi* driver, CUcontext target, ContextGuard& guard) {
     if (!target) return OK;
 
     CUcontext current;
-    CUresult res = g_cuCtxGetCurrent(&current);
+    CUresult res = driver->cuCtxGetCurrent(&current);
     if (res != CUDA_SUCCESS) {
         return raise(PyExc_RuntimeError, "Failed to get current CUDA context: %s",
-                     get_cuda_error(res));
+                     get_cuda_error(driver, res));
     }
 
     if (current == target) return OK;
 
-    res = g_cuCtxPushCurrent(target);
+    res = driver->cuCtxPushCurrent(target);
     if (res != CUDA_SUCCESS) {
         return raise(PyExc_RuntimeError, "Failed to switch CUDA context: %s",
-                     get_cuda_error(res));
+                     get_cuda_error(driver, res));
     }
 
     guard.need_to_pop = true;
@@ -1137,16 +1147,16 @@ static bool validate_grid(const Grid& grid) {
     return true;
 }
 
-static bool try_clarify_invalid_value_error(const Grid& grid) {
+static bool try_clarify_invalid_value_error(const DriverApi* driver, const Grid& grid) {
     CUdevice dev;
-    if (g_cuCtxGetDevice(&dev) != CUDA_SUCCESS) return false;
+    if (driver->cuCtxGetDevice(&dev) != CUDA_SUCCESS) return false;
 
     for (int i = 0; i < Grid::Len; ++i) {
         int v;
         CUdevice_attribute attr = static_cast<CUdevice_attribute>(
             CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X + i
         );
-        if (g_cuDeviceGetAttribute(&v, attr, dev) != CUDA_SUCCESS) return false;
+        if (driver->cuDeviceGetAttribute(&v, attr, dev) != CUDA_SUCCESS) return false;
 
         if (grid.dims[i] > static_cast<unsigned>(v)) {
             raise(PyExc_ValueError, "Grid[%d] is too big: max=%d, got=%lu",
@@ -1157,21 +1167,24 @@ static bool try_clarify_invalid_value_error(const Grid& grid) {
     return false;
 }
 
-static Status launch(PyObject* dispatcher_pyobj, Grid grid, CUstream launch_stream,
-                     PyObject* const* pyargs, Py_ssize_t num_pyargs) {
+static Status launch(const DriverApi* driver,
+                     PyObject* dispatcher_pyobj,
+                     Grid grid,
+                     CUstream launch_stream,
+                     PyObject* const* pyargs,
+                     Py_ssize_t num_pyargs) {
     if (!validate_grid(grid)) return ErrorRaised;
 
     LaunchHelperPtr helper = launch_helper_get();
     get_pyarg_types(pyargs, num_pyargs, helper->pyarg_types);
-
     {
-        CUresult res = g_cuStreamGetCtx(launch_stream, &helper->cuda_context);
+        CUresult res = driver->cuStreamGetCtx(launch_stream, &helper->cuda_context);
         // INVALID_CONTEXT can happen when it is NULL stream and there is
         // no active context in current thread. We will still get the context
         // from the array arguments later during `extract_cuda_args`.
         if (res != CUDA_SUCCESS && res != CUDA_ERROR_INVALID_CONTEXT) {
             return raise(PyExc_RuntimeError, "Failed to get a CUDA context from a stream: %s",
-                         get_cuda_error(res));
+                         get_cuda_error(driver, res));
         }
     }
 
@@ -1209,20 +1222,21 @@ static Status launch(PyObject* dispatcher_pyobj, Grid grid, CUstream launch_stre
                     PythonArgProfile{*family_pp, std::move(arg_kinds)});
     }
 
-    if (!extract_cuda_args(pyargs, num_pyargs, profile->arg_kinds,
+    if (!extract_cuda_args(driver, pyargs, num_pyargs, profile->arg_kinds,
                            dispatcher.constant_arg_flags, *helper)) {
         return ErrorRaised;
     }
 
-    ContextGuard ctx_guard;
-    if (!maybe_switch_context(helper->cuda_context, ctx_guard))
+    ContextGuard ctx_guard(driver);
+    if (!maybe_switch_context(driver, helper->cuda_context, ctx_guard))
         return ErrorRaised;
 
     KernelFamily::KernelMap& kernel_map = profile->family->kernels_by_constants;
     TileKernel* kernel = kernel_map.find(helper->constants);
     if (!kernel) {
         // Slowest path: need to compile a new kernel
-        Result<TileKernel> res = compile(dispatcher, pyargs, num_pyargs, g_default_tile_context);
+        Result<TileKernel> res = compile(driver, dispatcher, pyargs, num_pyargs,
+                                         g_default_tile_context);
         if (!res.is_ok()) return ErrorRaised;
 
         kernel = kernel_map.insert(std::move(helper->constants), std::move(*res));
@@ -1233,17 +1247,17 @@ static Status launch(PyObject* dispatcher_pyobj, Grid grid, CUstream launch_stre
         {
             // check stream is not in capturing mode
             CUstreamCaptureStatus status;
-            CUresult res = g_cuStreamIsCapturing(launch_stream, &status);
+            CUresult res = driver->cuStreamIsCapturing(launch_stream, &status);
             if (res != CUDA_SUCCESS)
                 return raise(PyExc_RuntimeError, "Failed to check stream capturing status: %s",
-                        get_cuda_error(res));
+                        get_cuda_error(driver, res));
             if (status != CU_STREAM_CAPTURE_STATUS_NONE)
                 return raise(PyExc_RuntimeError, "List argument in CUDAGraph isn't supported yet");
         }
-        Result<StreamBufferPool*> pool_res = get_stream_buffer_pool(helper->cuda_context);
+        Result<StreamBufferPool*> pool_res = get_stream_buffer_pool(driver, helper->cuda_context);
         if (!pool_res.is_ok()) return ErrorRaised;
 
-        tx = stream_buffer_transaction_open(*pool_res, launch_stream);
+        tx = stream_buffer_transaction_open(driver, *pool_res, launch_stream);
         if (!tx) return raise(PyExc_RuntimeError, "Failed to open a stream buffer transaction");
 
         size_t size = helper->nested_arrays.size() * sizeof(helper->nested_arrays[0]);
@@ -1255,10 +1269,10 @@ static Status launch(PyObject* dispatcher_pyobj, Grid grid, CUstream launch_stre
         // and the GPU buffer.
         mem_copy(ptr.host, helper->nested_arrays.data(), size);
 
-        CUresult res = g_cuMemcpyHtoDAsync(ptr.device, ptr.host, size, launch_stream);
+        CUresult res = driver->cuMemcpyHtoDAsync(ptr.device, ptr.host, size, launch_stream);
         if (res != CUDA_SUCCESS) {
             return raise(PyExc_RuntimeError, "Failed to copy memory from host to device: %s",
-                         get_cuda_error(res));
+                         get_cuda_error(driver, res));
         }
 
         for (ListArg la : helper->list_args) {
@@ -1271,7 +1285,7 @@ static Status launch(PyObject* dispatcher_pyobj, Grid grid, CUstream launch_stre
     for (Word& arg : helper->cuargs)
         helper->cuarg_pointers.push_back(&arg);
 
-    CUresult res = g_cuLaunchKernel(
+    CUresult res = driver->cuLaunchKernel(
             reinterpret_cast<CUfunction>(kernel->cukernel.kernel),
             grid.dims[0], grid.dims[1], grid.dims[2],
             1, 1, 1, // block size set by driver
@@ -1281,11 +1295,11 @@ static Status launch(PyObject* dispatcher_pyobj, Grid grid, CUstream launch_stre
             nullptr);
 
     if (res != CUDA_SUCCESS) {
-        if (res == CUDA_ERROR_INVALID_VALUE && try_clarify_invalid_value_error(grid))
+        if (res == CUDA_ERROR_INVALID_VALUE && try_clarify_invalid_value_error(driver, grid))
             return ErrorRaised;
 
         return raise(PyExc_RuntimeError, "Failed to launch cuTile kernel: %s",
-                     get_cuda_error(res));
+                     get_cuda_error(driver, res));
     }
 
     return OK;
@@ -1424,24 +1438,9 @@ static Result<Grid> parse_grid(PyObject* tuple) {
 
 #define LAUNCH_SIGNATURE "launch(stream, grid, kernel, kernel_args, /)"
 
-static constexpr int MIN_DRIVER_VERSION = 13000;
-static int g_driver_version = 0;
-
 static PyObject* cuda_tile_launch(PyObject* mod, PyObject* const* args, Py_ssize_t nargs) {
-    if (g_driver_version == 0) {
-        CUresult res = g_cuDriverGetVersion(&g_driver_version);
-        if (res != CUDA_SUCCESS) {
-            return PyErr_Format(PyExc_RuntimeError, "cuDriverGetVersion: %s", get_cuda_error(res));
-        }
-    }
-    if (g_driver_version < MIN_DRIVER_VERSION) {
-        int major = g_driver_version / 1000;
-        int minor = (g_driver_version % 1000) / 10;
-        int required_major = MIN_DRIVER_VERSION / 1000;
-        return PyErr_Format(PyExc_RuntimeError,
-                "Minimum driver version required is %d.0, got %d.%d",
-                required_major, major, minor);
-    }
+    Result<const DriverApi*> driver = get_driver_api();
+    if (!driver.is_ok()) return nullptr;
 
     if (nargs != 4)
         return PyErr_Format(PyExc_TypeError, "Wrong number of arguments to " LAUNCH_SIGNATURE);
@@ -1471,7 +1470,8 @@ static PyObject* cuda_tile_launch(PyObject* mod, PyObject* const* args, Py_ssize
     PyObject** kernel_args = reinterpret_cast<PyTupleObject*>(kernel_args_pyobj)->ob_item;
     Py_ssize_t num_kernel_args = PyTuple_GET_SIZE(kernel_args_pyobj);
 
-    if (!launch(dispatcher_pyobj, *grid_res, *stream_res, kernel_args, num_kernel_args))
+    if (!launch(*driver, dispatcher_pyobj, *grid_res, *stream_res,
+                kernel_args, num_kernel_args))
         return nullptr;
 
     return Py_NewRef(Py_None);

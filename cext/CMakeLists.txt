@@ -74,6 +74,7 @@ target_link_options(_cext_shared PUBLIC ${cext_link_flags} ${nostdlib_flags} -Wl
 add_executable(test_stream_buffer
     test/test_stream_buffer.cpp
     cuda_loader.cpp
+    cuda_helper.cpp
     memory.cpp
     )
 target_compile_options(test_stream_buffer PUBLIC ${cext_compile_flags} ${test_coverage_options})

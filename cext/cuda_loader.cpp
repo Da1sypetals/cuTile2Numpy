@@ -50,11 +50,12 @@ F get_proc_address(cuGetProcAddress_v2_t getter,
 FOREACH_CUDA_FUNCTION_TO_LOAD(DEFINE_CUDA_FUNCTION_GLOBAL)
 
 #define GET_PROC_ADDRESS(name, cuda_ver) \
-        if (!(g_##name = get_proc_address<decltype(name)*>(_cuGetProcAddress, #name, cuda_ver))) \
+        if (!(driver_api.name = \
+                    get_proc_address<decltype(name)*>(_cuGetProcAddress, #name, cuda_ver))) \
             return ErrorRaised;
 
 
-Status cuda_loader_init() {
+static Status cuda_loader_init(DriverApi& driver_api) {
     PyPtr load_libcuda_mod = steal(PyImport_ImportModule("cuda.tile._load_libcuda"));
     if (!load_libcuda_mod) return ErrorRaised;
 
@@ -71,4 +72,23 @@ Status cuda_loader_init() {
     FOREACH_CUDA_FUNCTION_TO_LOAD(GET_PROC_ADDRESS)
 
     return OK;
+}
+
+
+static constexpr int MIN_DRIVER_VERSION = 13000;
+
+Result<const DriverApi*> get_driver_api() {
+    static bool initialized;
+    static DriverApi instance;
+    if (!initialized) {
+        if (!cuda_loader_init(instance))
+            return ErrorRaised;
+        CUresult res = instance.cuInit(0);
+        if (res != CUDA_SUCCESS)
+            return raise(PyExc_RuntimeError, "cuInit: %s", get_cuda_error(&instance, res));
+        if (!check_driver_version(&instance, MIN_DRIVER_VERSION))
+            return ErrorRaised;
+        initialized = true;
+    }
+    return &instance;
 }

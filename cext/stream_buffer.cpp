@@ -16,9 +16,9 @@ static inline DualPointer dualptr_offset(DualPointer ptr, size_t offset) {
     return {static_cast<char*>(ptr.host) + offset, ptr.device + offset};
 }
 
-static inline void dual_ptr_free(DualPointer ptr) {
-    g_cuMemFreeHost(ptr.host);
-    g_cuMemFree(ptr.device);
+static inline void dual_ptr_free(const DriverApi* driver, DualPointer ptr) {
+    driver->cuMemFreeHost(ptr.host);
+    driver->cuMemFree(ptr.device);
 }
 
 struct Chunk {
@@ -51,41 +51,41 @@ StreamBufferPool* stream_buffer_pool_new() {
     return new StreamBufferPool();
 }
 
-static void delete_chunk(Chunk* chunk) {
-    dual_ptr_free(chunk->ptr);
-    g_cuEventDestroy(chunk->event);
+static void delete_chunk(const DriverApi* driver, Chunk* chunk) {
+    dual_ptr_free(driver, chunk->ptr);
+    driver->cuEventDestroy(chunk->event);
     delete chunk;
 }
 
-static void reclaim_chunk(Chunk* chunk, StreamBufferPool* pool) {
+static void reclaim_chunk(const DriverApi* driver, Chunk* chunk, StreamBufferPool* pool) {
     if (chunk->capacity == pool->cur_chunk_capacity) {
         chunk->next = pool->chunk_freelist;
         pool->chunk_freelist = chunk;
     } else {
-        delete_chunk(chunk);
+        delete_chunk(driver, chunk);
     }
 }
 
-static void poll_events(StreamBuffer* sb, StreamBufferPool* pool) {
+static void poll_events(const DriverApi* driver, StreamBuffer* sb, StreamBufferPool* pool) {
     while (sb->head != sb->transaction_head) {
         Chunk* chunk = sb->head;
-        if (g_cuEventQuery(chunk->event) != CUDA_SUCCESS)
+        if (driver->cuEventQuery(chunk->event) != CUDA_SUCCESS)
             break;
 
         sb->head = chunk->next;
         if (!sb->head) sb->tail = nullptr;
-        reclaim_chunk(chunk, pool);
+        reclaim_chunk(driver, chunk, pool);
     }
 }
 
-static void reclaim(StreamBufferPool* pool) {
+static void reclaim(const DriverApi* driver, StreamBufferPool* pool) {
     size_t i = 0;
     size_t n = pool->stream_buffers.size();
 
     StreamBuffer** stream_buffers = pool->stream_buffers.data();
     while (i < n) {
         StreamBuffer* sb = stream_buffers[i];
-        poll_events(sb, pool);
+        poll_events(driver, sb, pool);
         if (!sb->head && !sb->open_transaction) {
             sb->next_free = pool->sb_freelist;
             pool->sb_freelist = sb;
@@ -100,20 +100,20 @@ static void reclaim(StreamBufferPool* pool) {
     pool->stream_buffers.resize(n);
 }
 
-static Chunk* new_chunk(size_t capacity) {
+static Chunk* new_chunk(const DriverApi* driver, size_t capacity) {
     DualPointer ptr;
-    if (g_cuMemAlloc(&ptr.device, capacity) != CUDA_SUCCESS)
+    if (driver->cuMemAlloc(&ptr.device, capacity) != CUDA_SUCCESS)
         return nullptr;
 
-    if (g_cuMemAllocHost(&ptr.host, capacity) != CUDA_SUCCESS) {
-        g_cuMemFree(ptr.device);
+    if (driver->cuMemAllocHost(&ptr.host, capacity) != CUDA_SUCCESS) {
+        driver->cuMemFree(ptr.device);
         return nullptr;
     }
 
     CUevent event;
-    if (g_cuEventCreate(&event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
-        g_cuMemFree(ptr.device);
-        g_cuMemFreeHost(ptr.host);
+    if (driver->cuEventCreate(&event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+        driver->cuMemFree(ptr.device);
+        driver->cuMemFreeHost(ptr.host);
         return nullptr;
     }
 
@@ -126,10 +126,10 @@ static Chunk* new_chunk(size_t capacity) {
 }
 
 
-static void delete_free_chunks(StreamBufferPool* pool) {
+static void delete_free_chunks(const DriverApi* driver, StreamBufferPool* pool) {
     for (Chunk *chunk = pool->chunk_freelist, *next; chunk; chunk = next) {
         next = chunk->next;
-        delete_chunk(chunk);
+        delete_chunk(driver, chunk);
     }
     pool->chunk_freelist = nullptr;
 }
@@ -146,13 +146,13 @@ static StreamBuffer* alloc_stream_buffer(StreamBufferPool* pool, CUstream stream
     return sb;
 }
 
-static Chunk* allocate_chunk(StreamBufferPool* pool, StreamBuffer* sb,
+static Chunk* allocate_chunk(const DriverApi* driver, StreamBufferPool* pool, StreamBuffer* sb,
                              size_t requested_alloc_size) {
     size_t chunk_capacity = pool->cur_chunk_capacity;
 
     if (chunk_capacity / kMinChunkToAllocationRatio >= requested_alloc_size) {
         if (!pool->chunk_freelist)
-            reclaim(pool);
+            reclaim(driver, pool);
 
         if (pool->chunk_freelist) {
             // Fast path: get a chunk from the free list
@@ -172,9 +172,9 @@ static Chunk* allocate_chunk(StreamBufferPool* pool, StreamBuffer* sb,
             chunk_capacity *= 2;
         } while (chunk_capacity / kMinChunkToAllocationRatio < requested_alloc_size);
         pool->cur_chunk_capacity = chunk_capacity;
-        delete_free_chunks(pool);
+        delete_free_chunks(driver, pool);
     }
-    return new_chunk(chunk_capacity);
+    return new_chunk(driver, chunk_capacity);
 }
 
 static size_t find_stream(const Vec<unsigned long long>& stream_ids, unsigned long long stream_id) {
@@ -185,9 +185,11 @@ static size_t find_stream(const Vec<unsigned long long>& stream_ids, unsigned lo
     return SIZE_MAX;
 }
 
-StreamBufferTransaction stream_buffer_transaction_open(StreamBufferPool* pool, CUstream stream) {
+StreamBufferTransaction stream_buffer_transaction_open(const DriverApi* driver,
+                                                       StreamBufferPool* pool,
+                                                       CUstream stream) {
     unsigned long long stream_id;
-    if (g_cuStreamGetId(stream, &stream_id) != CUDA_SUCCESS)
+    if (driver->cuStreamGetId(stream, &stream_id) != CUDA_SUCCESS)
         return {};
 
     const Vec<unsigned long long>& stream_ids = pool->stream_ids;
@@ -203,12 +205,13 @@ StreamBufferTransaction stream_buffer_transaction_open(StreamBufferPool* pool, C
     CHECK(!sb->open_transaction);
     sb->open_transaction = true;
     sb->transaction_head = nullptr;
-    return StreamBufferTransaction(pool, sb, stream);
+    return StreamBufferTransaction(pool, sb, stream, driver);
 }
 
 DualPointer StreamBufferTransaction::allocate(size_t size) {
     StreamBufferPool* pool = this->pool_;
     StreamBuffer* sb = this->sb_;
+    const DriverApi* driver = this->driver_;
 
     if (size >= SIZE_MAX - kAlignment)
         return {};
@@ -217,7 +220,7 @@ DualPointer StreamBufferTransaction::allocate(size_t size) {
 
     Chunk* chunk = sb->tail;
     if (!chunk || chunk->available < size) {
-        chunk = allocate_chunk(pool, sb, size);
+        chunk = allocate_chunk(driver, pool, sb, size);
         if (!chunk) return {};
         if (sb->tail)
             sb->tail->next = chunk;
@@ -238,13 +241,14 @@ void StreamBufferTransaction::close() {
     if (!sb) return;
 
     CUstream stream = this->stream_;
+    const DriverApi* driver = this->driver_;
 
     this->pool_ = nullptr;
     this->sb_ = nullptr;
     this->stream_ = {};
 
     for (Chunk* chunk = sb->transaction_head; chunk; chunk = chunk->next) {
-        CUresult res = g_cuEventRecord(chunk->event, stream);
+        CUresult res = driver->cuEventRecord(chunk->event, stream);
         CHECK(res == CUDA_SUCCESS);  // TODO: is there a more graceful way to recover?
     }
 

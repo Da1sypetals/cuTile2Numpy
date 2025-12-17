@@ -9,8 +9,6 @@
 #include "py.h"
 #include <cuda.h>
 
-Status cuda_loader_init();
-
 #define FOREACH_CUDA_FUNCTION_TO_LOAD(X) \
     X(cuInit, 2000) \
     X(cuLibraryLoadFromFile, 12000) \
@@ -47,8 +45,10 @@ Status cuda_loader_init();
 
 
 #define DECLARE_CUDA_FUNC_EXTERN(name, _cuda_version) \
-    extern decltype(name)* g_##name;
+    decltype(::name)* name;
 
-FOREACH_CUDA_FUNCTION_TO_LOAD(DECLARE_CUDA_FUNC_EXTERN)
+struct DriverApi {
+    FOREACH_CUDA_FUNCTION_TO_LOAD(DECLARE_CUDA_FUNC_EXTERN)
+};
 
-
+Result<const DriverApi*> get_driver_api();

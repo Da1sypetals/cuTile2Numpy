@@ -4,7 +4,6 @@
 
 #include "py.h"
 
-#include "cuda_loader.h"
 #include "tile_kernel.h"
 #include "cuda_helper.h"
 
@@ -20,11 +19,6 @@ static PyModuleDef module_def = {
 };
 
 PyMODINIT_FUNC PyInit__cext() {
-    if (!cuda_loader_init())
-        return nullptr;
-
-    try_init_cuda();
-
     PyPtr m = steal(PyModule_Create(&module_def));
     if (!m) return nullptr;
 
