@@ -327,6 +327,7 @@ def nested_block(name: str, loc: Loc, params: Sequence[Var] = (),
     new_loop_info = loop_info or prev_builder.loop_info
     new_if_else_info = if_else_info or prev_builder.if_else_info
     scope = prev_builder.scope
+    loc = loc.with_call_site(scope.call_site)
     with Builder(prev_builder.ir_ctx, loc, scope, new_loop_info, new_if_else_info) as builder, \
             scope.local.enter_branch():
         yield block
@@ -410,6 +411,7 @@ class _OverlayDict:
 class Scope:
     local: LocalScope
     frozen_globals: Mapping[str, Any]
+    call_site: Loc | None
 
 
 class Builder:

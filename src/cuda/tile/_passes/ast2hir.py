@@ -10,14 +10,14 @@ from enum import Enum, auto
 from typing import List, Sequence, Optional, Any, Dict, Type, Callable
 
 from cuda.tile import _datatype as datatype
-from cuda.tile._exception import TileSyntaxError, Loc
+from cuda.tile._exception import TileSyntaxError, Loc, FunctionDesc
 from cuda.tile._ir.ir import IRContext, Var
 from cuda.tile._ir import hir
 
 
 def get_function_hir(pyfunc: Callable,
                      ir_ctx: IRContext,
-                     call_site: Optional[Loc]) -> hir.Function:
+                     entry_point: bool) -> hir.Function:
     # Get the original function from the decorated function if it exists.
     pyfunc = getattr(pyfunc, "__wrapped__", pyfunc)
 
@@ -56,14 +56,17 @@ def get_function_hir(pyfunc: Callable,
         for name, cell in zip(pyfunc.__code__.co_freevars, pyfunc.__closure__):
             func_globals[name] = cell.cell_contents
 
-    ctx = _Context(inspect.getfile(pyfunc), first_line, call_site, pyfunc, ir_ctx)
+    filename = inspect.getfile(pyfunc)
+    desc = FunctionDesc(func_def.name, filename, first_line)
+    ctx = _Context(filename, first_line, desc, entry_point, ir_ctx)
     assert isinstance(func_def, ast.FunctionDef)
     body = _ast2hir(func_def, ctx)
     all_ast_args = _get_all_parameters(func_def, ctx)
     param_names = tuple(p.arg for p in all_ast_args)
     param_locs = tuple(ctx.get_loc(p) for p in all_ast_args)
     body.stored_names.update(param_names)
-    return hir.Function(body, param_names, param_locs, func_globals)
+
+    return hir.Function(desc, body, param_names, param_locs, func_globals)
 
 
 # Translate the 1-based line number of the chunk we passed to the AST parser
@@ -81,13 +84,12 @@ class LoopKind(Enum):
 
 
 class _Context:
-    def __init__(self, filename: str, first_line: int, call_site: Optional[Loc],
-                 function: Callable, ir_ctx: IRContext):
+    def __init__(self, filename: str, first_line: int, function_desc: FunctionDesc,
+                 entry_point: bool, ir_ctx: IRContext):
         self.filename = filename
         self.first_line = first_line
-        self.entry_point = call_site is None
-        self.call_site = call_site
-        self.function = function
+        self.function_desc = function_desc
+        self.entry_point = entry_point
         self.parent_loops: List[LoopKind] = []
         self.current_loc = Loc.unknown()
         self.current_block: Optional[hir.Block] = None
@@ -145,8 +147,7 @@ class _Context:
         # Subtract 1 from the column offset to correct for an extra level
         # of indentation we inserted for the dummy "if True" block.
         return Loc(line_no, node.col_offset - 1, self.filename,
-                   last_line_no, node.end_col_offset - 1, self.function,
-                   self.call_site)
+                   last_line_no, node.end_col_offset - 1, self.function_desc)
 
     def syntax_error(self, message: str, loc=None) -> TileSyntaxError:
         if loc is None:

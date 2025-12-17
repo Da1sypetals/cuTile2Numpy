@@ -42,7 +42,9 @@ from cuda.tile._datatype import (
 from cuda.tile._exception import (
     TileCompilerExecutionError,
     TileCompilerTimeoutError,
+    TileError,
     TileInternalError,
+    TileRecursionError,
     TileSyntaxError,
     TileTypeError,
     TileValueError,
@@ -172,7 +174,9 @@ __all__ = [
 
     "TileCompilerExecutionError",
     "TileCompilerTimeoutError",
+    "TileError",
     "TileInternalError",
+    "TileRecursionError",
     "TileSyntaxError",
     "TileTypeError",
     "TileValueError",

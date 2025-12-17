@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from textwrap import indent
 from typing import Any, Set, Mapping
 
-from cuda.tile._exception import Loc
+from cuda.tile._exception import Loc, FunctionDesc
 from cuda.tile._ir.ir import Var
 
 
@@ -97,6 +97,7 @@ class Block:
 
 @dataclass
 class Function:
+    desc: FunctionDesc
     body: Block
     param_names: tuple[str, ...]
     param_locs: tuple[Loc, ...]

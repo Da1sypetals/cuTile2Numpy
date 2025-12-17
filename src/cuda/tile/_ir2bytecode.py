@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import inspect
 import os
 from contextlib import contextmanager
 from typing import Dict, Tuple, Sequence, Any, List, Optional, Iterator, Set
@@ -14,7 +13,8 @@ from cuda.tile import DType, RoundingMode, PaddingMode
 import cuda.tile._bytecode as bc
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._debug import CUDA_TILE_TESTING_DISABLE_DIV
-from cuda.tile._exception import TileInternalError, TileError, ConstFoldNotImplementedError
+from cuda.tile._exception import TileInternalError, TileError, ConstFoldNotImplementedError, \
+    FunctionDesc
 from cuda.tile._ir.ir import Block, Loc, Var, IRContext
 from cuda.tile._ir.ops_utils import (
     padding_mode_to_bytecode, rounding_mode_to_bytecode,
@@ -472,27 +472,24 @@ class DebugAttrMap:
         self._linkage_name = linkage_name
         self._anonymize = anonymize
 
-    def get_subprogram(self, pyfunc) -> bc.DebugAttrId:
+    def get_subprogram(self, func_desc: FunctionDesc) -> bc.DebugAttrId:
         try:
-            return self._subprogram_cache[pyfunc]
+            return self._subprogram_cache[func_desc]
         except KeyError:
             pass
 
-        func_name = pyfunc.__name__
-        func_filename = inspect.getfile(pyfunc)
-        _, func_line = inspect.findsource(pyfunc)
-        func_dirname, func_basename = os.path.split(func_filename)
+        func_dirname, func_basename = os.path.split(func_desc.filename)
         file_attr = self._debug_attr_table.file(func_basename, func_dirname)
         compile_unit_attr = self._debug_attr_table.compile_unit(file_attr)
         ret = self._debug_attr_table.subprogram(
             file=file_attr,
-            line=func_line,
-            name=func_name,
+            line=func_desc.line,
+            name=func_desc.name,
             linkage_name=self._linkage_name,
             compile_unit=compile_unit_attr,
-            scope_line=func_line,
+            scope_line=func_desc.line,
         )
-        self._subprogram_cache[pyfunc] = ret
+        self._subprogram_cache[func_desc] = ret
         return ret
 
     def get_debugattr(self, loc: Loc) -> bc.DebugAttrId:

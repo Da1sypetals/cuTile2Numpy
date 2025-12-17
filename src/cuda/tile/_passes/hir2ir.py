@@ -6,11 +6,11 @@ import inspect
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 from .ast2hir import get_function_hir
 from .. import TileTypeError
-from .._exception import Loc, TileSyntaxError, TileInternalError, TileError
+from .._exception import Loc, TileSyntaxError, TileInternalError, TileError, TileRecursionError
 from .._ir import hir, ir
 from .._ir.ir import Var, IRContext, Argument, Scope, LocalScope
 from .._ir.op_impl import op_implementations, impl
@@ -20,10 +20,13 @@ from .._ir.type import FunctionTy, BoundMethodTy, DTypeConstructor
 from .._ir.typing_support import get_signature
 
 
+MAX_RECURSION_DEPTH = 50
+
+
 def hir2ir(func_hir: hir.Function,
            args: tuple[Argument, ...],
            ir_ctx: IRContext) -> ir.Block:
-    scope = _create_scope(func_hir, ir_ctx)
+    scope = _create_scope(func_hir, ir_ctx, call_site=None)
     ir_params = tuple(scope.local.redefine(name, loc)
                       for name, loc in zip(func_hir.param_names, func_hir.param_locs, strict=True))
     preamble = []
@@ -50,9 +53,9 @@ def hir2ir(func_hir: hir.Function,
     return ret
 
 
-def _create_scope(func_hir: hir.Function, ir_ctx: IRContext):
+def _create_scope(func_hir: hir.Function, ir_ctx: IRContext, call_site: Loc | None) -> Scope:
     local_scope = LocalScope(func_hir.body.stored_names, ir_ctx)
-    return Scope(local_scope, func_hir.frozen_globals)
+    return Scope(local_scope, func_hir.frozen_globals, call_site)
 
 
 def dispatch_hir_block(block: hir.Block):
@@ -83,7 +86,8 @@ def _dispatch_hir_block_inner(preamble: Sequence[hir.Call],
         if not _dispatch_hir_calls(state, builder):
             return ()
         result_vars = tuple(_resolve_operand(x) for x in block.results)
-        with _wrap_exceptions(block.jump_loc), builder.change_loc(block.jump_loc):
+        loc = _add_call_site(block.jump_loc, builder)
+        with _wrap_exceptions(loc), builder.change_loc(loc):
             _dispatch_hir_jump(block.jump, result_vars)
     except Exception:
         if 'CUTILEIR' in builder.ir_ctx.tile_ctx.config.log_keys:
@@ -120,7 +124,8 @@ def _dispatch_hir_jump(jump: hir.Jump,
 def _dispatch_hir_calls(state: _State, cur_builder: ir.Builder) -> bool:
     while len(state.todo_stack) > 0:
         with state.next_call() as call:
-            with _wrap_exceptions(call.loc), cur_builder.change_loc(call.loc):
+            loc = _add_call_site(call.loc, cur_builder)
+            with _wrap_exceptions(loc), cur_builder.change_loc(loc):
                 _dispatch_call(call, cur_builder, state.todo_stack)
             if cur_builder.is_terminated:
                 # The current block has been terminated, e.g. by flattening an if-else
@@ -128,6 +133,10 @@ def _dispatch_hir_calls(state: _State, cur_builder: ir.Builder) -> bool:
                 # we signal that the original jump and block results should be ignored.
                 return False
     return True
+
+
+def _add_call_site(loc: Loc, builder: ir.Builder) -> Loc:
+    return loc.with_call_site(builder.scope.call_site)
 
 
 @contextmanager
@@ -183,14 +192,14 @@ def _dispatch_call(call: hir.Call, builder: ir.Builder, todo_stack: list[hir.Cal
                 builder.ops[i] = builder.ops[i].clone(mapper)
     else:
         # Callee is a user-defined function.
-        _check_recursive_call(call.loc, callee)
+        _check_recursive_call(builder.loc)
         sig = get_signature(callee)
         for param_name, param in sig.parameters.items():
             if param.kind in (inspect.Parameter.VAR_POSITIONAL,
                               inspect.Parameter.VAR_KEYWORD):
                 raise TileSyntaxError("Variadic parameters in user-defined"
                                       " functions are not supported")
-        callee_hir = get_function_hir(callee, builder.ir_ctx, call_site=call.loc)
+        callee_hir = get_function_hir(callee, builder.ir_ctx, entry_point=False)
 
         # Since `todo_stack` is a stack, we push things backwards. First, we push identity()
         # calls to assign the temporary return values back to the original result variables.
@@ -202,7 +211,7 @@ def _dispatch_call(call: hir.Call, builder: ir.Builder, todo_stack: list[hir.Cal
         # For this purpose, we push a call to the special _set_scope stub.
         old_scope = builder.scope
         todo_stack.append(hir.Call((), _set_scope, (old_scope,), (), call.loc))
-        builder.scope = _create_scope(callee_hir, builder.ir_ctx)
+        builder.scope = _create_scope(callee_hir, builder.ir_ctx, call_site=builder.loc)
 
         # Now push the function body.
         todo_stack.extend(reversed(callee_hir.body.calls))
@@ -219,11 +228,14 @@ def _is_freshly_defined(var: Var, builder: ir.Builder, first_idx: int):
                for r in builder.ops[i].result_vars)
 
 
-def _check_recursive_call(call_loc: Loc, callee: Callable):
+def _check_recursive_call(call_loc: Loc):
+    depth = 1
     while call_loc is not None:
-        if call_loc.function is callee:
-            raise TileTypeError("Recursive function call detected")
+        depth += 1
         call_loc = call_loc.call_site
+    if depth > MAX_RECURSION_DEPTH:
+        raise TileRecursionError(f"Maximum recursion depth ({MAX_RECURSION_DEPTH}) reached"
+                                 f" while inlining a function call")
 
 
 def _get_callee_and_self(callee_var: Var) -> tuple[Any, tuple[()] | tuple[Var]]:

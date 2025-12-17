@@ -1,12 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
-
+import dataclasses
 import linecache
 import re
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Optional
 from unicodedata import east_asian_width
+
+
+@dataclass(eq=False, frozen=True)
+class FunctionDesc:
+    name: str
+    filename: str
+    line: int
 
 
 @dataclass(slots=True)
@@ -16,8 +23,11 @@ class Loc:
     filename: Optional[str] = None
     last_line: Optional[int] = None
     end_col: Optional[int] = None
-    function: Optional[Callable] = None
+    function: Optional[FunctionDesc] = None
     call_site: Optional["Loc"] = None
+
+    def with_call_site(self, call_site) -> "Loc":
+        return dataclasses.replace(self, call_site=call_site)
 
     def __str__(self) -> str:
         if self.filename:
@@ -49,6 +59,14 @@ def _wcwidth(s: str) -> int:
 
 
 def format_location(loc: Loc):
+    frames = []
+    while loc is not None:
+        frames.append(loc)
+        loc = loc.call_site
+    return "".join(_format_location_frame(x) for x in reversed(frames))
+
+
+def _format_location_frame(loc: Loc) -> str:
     if loc.is_unknown():
         return "Unknown location"
 
@@ -74,12 +92,14 @@ def format_location(loc: Loc):
         cols_str = f"col {visual_col + 1}"
     else:
         end_visual_col = _wcwidth(line_bytes[:end_col].decode())
-        cols_str = f"col {visual_col + 1}--{end_visual_col}"
+        cols_str = f"col {visual_col + 1}-{end_visual_col}"
 
     spaces = " " * visual_col
     carets = "^" * (end_visual_col - visual_col)
 
-    return (f'  In file "{loc.filename}", {lines_str}, {cols_str}:\n'
+    func_str = "" if loc.function is None else f", in {loc.function.name}"
+
+    return (f'  "{loc.filename}", {lines_str}, {cols_str}{func_str}:\n'
             f"    {line_text}\n"
             f"    {spaces}{carets}\n")
 
@@ -101,6 +121,12 @@ class TileSyntaxError(TileError):
 class TileTypeError(TileError):
     """Exception when an unexpected type or |data type| is encountered."""
     pass
+
+
+class TileRecursionError(TileError):
+    """Thrown at compile time to indicate that the recursion limit has been reached
+    when inlining a function call.
+    """
 
 
 class TileValueError(TileError):

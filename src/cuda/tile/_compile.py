@@ -75,7 +75,7 @@ def global_compiler_lock(func):
 
 def _get_final_ir(pyfunc, args, tile_context) -> ir.Block:
     ir_ctx = ir.IRContext(tile_context)
-    func_hir: hir.Function = get_function_hir(pyfunc, ir_ctx, call_site=None)
+    func_hir: hir.Function = get_function_hir(pyfunc, ir_ctx, entry_point=True)
 
     ir_args = _bind_kernel_arguments(func_hir.param_names, args, get_constant_annotations(pyfunc))
     func_body = hir2ir(func_hir, ir_args, ir_ctx)

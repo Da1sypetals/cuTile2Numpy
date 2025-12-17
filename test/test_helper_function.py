@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
+import inspect
 
 import pytest
 import torch
 from math import ceil
 import cuda.tile as ct
 from util import assert_close
-from cuda.tile._exception import TileTypeError, TileSyntaxError
+from cuda.tile._exception import TileTypeError, TileSyntaxError, TileRecursionError
 
 
 @pytest.fixture
@@ -122,27 +123,33 @@ def test_helper_function_keyword_args(shape, tile, func):
 
 def helper_function_recursive_calls(input, N):
     if N > 0:
-        x = helper_function_recursive_calls(input, N-1)
+        x = helper_function_recursive_calls(input, N - 1) + 1
     else:
         x = input
-    return x + 1
+    return x
 
 
 @ct.kernel
-def main_kernel_recursive_calls(x, output, B: ct.Constant[int], N: ct.Constant[int]):
-    px = ct.bid(0)
-    tile_x = ct.load(x, index=(px, 0), shape=(B, N))
-    x1 = helper_function_recursive_calls(tile_x, 100)
-    ct.store(output, index=(px, 0), tile=x1)
+def main_kernel_recursive_calls(x, output, N: ct.Constant[int]):
+    tile_x = ct.gather(x, ())
+    x1 = helper_function_recursive_calls(tile_x, N)
+    ct.scatter(output, (), x1)
 
 
-def test_reject_recursive_helper_function(shape, tile):
-    x = torch.rand(shape, dtype=torch.float32, device="cuda")
+def test_reject_runaway_recursion():
+    x = torch.tensor(100.0, dtype=torch.float32, device="cuda")
     y = torch.zeros_like(x)
-    grid = (ceil(shape[0] / tile), 1, 1)
-    with pytest.raises(TileTypeError, match="Recursive function call detected"):
-        ct.launch(torch.cuda.current_stream(), grid, main_kernel_recursive_calls,
-                  (x, y, tile, shape[1]))
+    with pytest.raises(TileRecursionError):
+        ct.launch(torch.cuda.current_stream(), (1,), main_kernel_recursive_calls,
+                  (x, y, 100000))
+
+
+def test_accept_short_recursion():
+    x = torch.tensor(100.0, dtype=torch.float32, device="cuda")
+    y = torch.zeros_like(x)
+    ct.launch(torch.cuda.current_stream(), (1,), main_kernel_recursive_calls,
+              (x, y, 9))
+    assert y.item() == 109.0
 
 
 def helper_function_array_arguments(x, y, output, B: ct.Constant[int], N: ct.Constant[int]):
@@ -314,3 +321,32 @@ def test_helper_function_using_ct_api(shape, tile):
     )
     ref_result = x + 1
     assert_close(y, ref_result, atol=1e-4, rtol=1e-5)
+
+
+def test_error_message_stack_trace():
+    def bar(x):  # Line +1
+        ct.abracadabra(x)
+
+    def foo(x):  # Line + 4
+        bar(x)
+
+    @ct.kernel
+    def kernel(x):  # Line +8
+        foo(x)
+
+    x = torch.zeros((), device="cuda")
+    _, first_line = inspect.getsourcelines(test_error_message_stack_trace)
+    msg_regex = (
+        "No such attribute 'abracadabra'.*\n"
+        f".*test_helper_function.py\", line {first_line + 9}.*, in kernel:\n"
+        f" *foo\\(x\\)\n"
+        f" *\\^\\^\\^\\^\\^\\^\n"
+        f".*test_helper_function.py\", line {first_line + 5}.*, in foo:\n"
+        f" *bar\\(x\\)\n"
+        f" *\\^\\^\\^\\^\\^\\^\n"
+        f".*test_helper_function.py\", line {first_line + 2}.*, in bar:\n"
+        f"            ct.abracadabra\\(x\\)\n"
+        f"            \\^\\^\\^\\^\\^\\^\\^\\^\\^\\^\\^\\^\\^\\^\n"
+    )
+    with pytest.raises(TileTypeError, match=msg_regex):
+        ct.launch(torch.cuda.current_stream(), (1,), kernel, (x,))
