@@ -300,7 +300,7 @@ def _to_token_order_in_block(block: Block,
                     body_token_map[last_store_key], result_token_map[last_store_key] = \
                         append_new_carried_var(token_map[last_store_key])
                 else:
-                    raise ValueError(f"Unsupported memory effect: {effect}")
+                    raise TileInternalError(f"Unexpected memory effect: {effect}")
 
             if body_mem_effects.has_acquire_order:
                 body_token_map[ACQUIRE_TOKEN_KEY], result_token_map[ACQUIRE_TOKEN_KEY] = \
@@ -360,7 +360,7 @@ def _to_token_order_in_block(block: Block,
                     result_token_map[last_op_key] = add_new_ifelse_result()
                     result_token_map[last_store_key] = add_new_ifelse_result()
                 else:
-                    raise ValueError(f"Unsupported memory effect: {effect}")
+                    raise TileInternalError(f"Unexpected memory effect: {effect}")
 
             if merged_mem_effects.has_acquire_order:
                 result_token_map[ACQUIRE_TOKEN_KEY] = add_new_ifelse_result()
