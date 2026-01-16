@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+ir_artifacts
+
 .*.swp
 __pycache__
 *.egg-info
