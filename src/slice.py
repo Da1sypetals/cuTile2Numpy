@@ -96,6 +96,7 @@ launch_numpy(
 
 expected = np.matmul(a, b) + a.shape[0]
 
+np.set_printoptions(precision=3)
 mae = np.abs(expected - c).mean()
 print(f"MAE: {mae}")
 ic(expected[0, :3, :3])

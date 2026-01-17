@@ -377,6 +377,8 @@ max_rel_diff = rel_diff.reshape(batch, -1).max(-1).values.tolist()
 # print(f"mean_rel_diff: {format_list(mean_rel_diff)}")
 # print(f"max_rel_diff: {format_list(max_rel_diff)}")
 
+np.set_printoptions(precision=3)
+
 print(f"Max MAE = {max(MAE)}")
 print(f"Max max_abs_diff = {max(max_abs_diff)}")
 print(f"Max mean_rel_diff = {max(mean_rel_diff)}")

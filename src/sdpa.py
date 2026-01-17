@@ -139,6 +139,7 @@ v_torch = torch.from_numpy(v).permute(0, 2, 1, 3)  # (b, h_kv, s_kv, d)
 out_torch = torch.nn.functional.scaled_dot_product_attention(q_torch, k_torch, v_torch, enable_gqa=True)
 expected = out_torch.permute(0, 2, 1, 3).numpy()
 
+np.set_printoptions(precision=3)
 mae = np.abs(out - expected).mean()
 print(f"MAE: {mae}")
 ic(out[0, 0, :3, :3])
