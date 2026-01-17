@@ -1,5 +1,5 @@
 import numpy as np
-from cuda.tile.utils.dumper import get_function_repr_optimized
+from cuda.tile.utils.dumper import get_function_repr
 from cuda.tile.utils.mock_tensor import MockTensor
 from cuda.tile.utils.transpiler.simplify_passes import simplify_for_numpy
 from cuda.tile.utils.transpiler.serialize_to_dict import serialize_function
@@ -94,7 +94,7 @@ def transpile(
     out_dir.mkdir(exist_ok=True, parents=True)
 
     # Generate function representation
-    func_repr = get_function_repr_optimized(kernel, args)
+    func_repr = get_function_repr(kernel, args)
     simplify_for_numpy(func_repr)
 
     if save_cutileir:

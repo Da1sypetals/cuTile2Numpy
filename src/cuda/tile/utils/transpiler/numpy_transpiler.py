@@ -725,7 +725,7 @@ class NumpyTranspiler:
         params = op["nested_blocks"][0]["params"]
 
         param_names = []
-        if result_vars: # If the loop carry any variable
+        if result_vars:  # If the loop carry any variable
             initial_vals = [self.get_var_name(var["name"]) for var in op["operands"]["initial_values"]]
 
             if iterable is not None:

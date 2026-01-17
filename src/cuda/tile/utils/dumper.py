@@ -5,7 +5,6 @@ from cuda.tile._cext import default_tile_context, get_compute_capability
 from cuda.tile._compile import _get_final_ir
 from cuda.tile._compiler_options import CompilerOptions
 from cuda.tile._ir2bytecode import generate_bytecode_for_kernel
-from cuda.tile.utils.extra_passes import eliminate_bound
 
 
 def _get_sm_arch(compute_capability: tuple[int, int] | None = None) -> str:
@@ -25,7 +24,7 @@ def _get_sm_arch(compute_capability: tuple[int, int] | None = None) -> str:
     return f"sm_{major}{minor}"
 
 
-def get_function_repr_optimized(kernel_func, args: list):
+def get_function_repr(kernel_func, args: list):
     """
     Get the FunctionIR object after type inference pass.
 
@@ -39,9 +38,7 @@ def get_function_repr_optimized(kernel_func, args: list):
 
     pyfunc = kernel_func._pyfunc
 
-
     func_ir = _get_final_ir(pyfunc, args, default_tile_context)
-    eliminate_bound(func_ir)
     return func_ir
 
 
