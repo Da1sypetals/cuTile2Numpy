@@ -8,7 +8,7 @@ from cuda.tile.utils.transpiler.logging import get_logger
 logger = get_logger(__name__)
 
 # FATAL: EVERY unimplemented or unsupported feature should raise an error.
-# DO NOT silently ignore or skip of fallback for unsupported features.
+# DO NOT silently ignore or skip or fallback for unsupported features.
 
 DTYPE_MAP = {
     "bool": np.bool_,

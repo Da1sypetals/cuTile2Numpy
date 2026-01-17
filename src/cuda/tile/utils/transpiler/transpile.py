@@ -38,44 +38,50 @@ def launch_numpy(
         grid: Tuple (grid_x, grid_y, grid_z) specifying the grid dimensions
         tmp_dir: Optional temporary directory for transpiled code. If None, creates a temp dir.
     """
-    # Create temporary directory if not provided
+    # Manage temporary directory manually
+    tmp_ctx = None
     if tmp_dir is None:
-        tmp_dir = tempfile.mkdtemp(prefix="cutile_numpy_")
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="cutile_numpy_")
+        tmp_dir = tmp_ctx.__enter__()
         logger.info(f"Created temporary directory: {tmp_dir}")
 
-    # Transpile kernel to NumPy code
-    transpile(
-        kernel,
-        args,
-        out_dir=tmp_dir,
-        save_cutileir=True,
-        save_json=True,
-        save_kernel=True,
-    )
+    try:
+        # Transpile kernel to NumPy code
+        transpile(
+            kernel,
+            args,
+            out_dir=tmp_dir,
+            save_cutileir=True,
+            save_json=True,
+            save_kernel=True,
+        )
 
-    # Dynamically import the generated module
-    numpy_code_path = Path(tmp_dir) / "numpy_code.py"
-    module_name = f"cutile_numpy_{kernel._pyfunc.__name__}"
+        # Dynamically import the generated module
+        numpy_code_path = Path(tmp_dir) / "numpy_code.py"
+        module_name = f"cutile_numpy_{kernel._pyfunc.__name__}"
 
-    # Load the module from file
-    spec = importlib.util.spec_from_file_location(module_name, numpy_code_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load module from {numpy_code_path}")
+        # Load the module from file
+        spec = importlib.util.spec_from_file_location(module_name, numpy_code_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Failed to load module from {numpy_code_path}")
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
 
-    # Get the generated function
-    func_name = kernel._pyfunc.__name__
-    if not hasattr(module, func_name):
-        raise AttributeError(f"Module does not contain function '{func_name}'")
+        # Get the generated function
+        func_name = kernel._pyfunc.__name__
+        if not hasattr(module, func_name):
+            raise AttributeError(f"Module does not contain function '{func_name}'")
 
-    numpy_func = getattr(module, func_name)
+        numpy_func = getattr(module, func_name)
 
-    # Call the function with args and grid
-    logger.info(f"Launching {func_name} with grid={grid}")
-    numpy_func(*args, grid=grid)
+        # Call the function with args and grid
+        logger.info(f"Launching {func_name} with grid={grid}")
+        numpy_func(*args, grid=grid)
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.__exit__(None, None, None)
 
 
 def transpile(

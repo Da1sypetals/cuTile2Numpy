@@ -346,6 +346,7 @@ launch_numpy(
     sinkhorn_knopp_bwd_implicit_cg,
     [out, dout, res],
     grid=(1, batch // 32, 1),
+    tmp_dir=bwd_dir,
 )
 grad_M_implicit = torch.from_numpy(res).squeeze(0)
 
