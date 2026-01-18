@@ -33,6 +33,25 @@ def str_to_dtype(dtype_str: str):
         raise ValueError(f"Unknown dtype: {dtype_str}")
 
 
+def val_to_str(val: bool | int | float):
+    if isinstance(val, (bool, int, float)):
+        return str(val)
+    elif isinstance(val, str):
+        match str(val):
+            # Handle special floats
+            case "inf":
+                return "np.inf"
+            case "-inf":
+                return "-np.inf"
+            case "nan":
+                return "np.nan"
+            case _:
+                raise TypeError(f"Unsupported value as string for val_to_str: {val}")
+
+    else:
+        raise TypeError(f"Unsupported type for val_to_str: {type(val)}")
+
+
 def join_tuple_elems(iterable: Iterable[str]) -> str:
     """
     Tuple allow trailing comma, so we make use of it.
@@ -308,7 +327,8 @@ class NumpyTranspiler:
                     np_dtype = str_to_dtype(dtype_str)
 
                     # Generate array filled with constant value
-                    self.emit(f"{res} = np.full(({shape_str}), {val}, dtype={np_dtype})")
+                    val_str = val_to_str(val)
+                    self.emit(f"{res} = np.full(({shape_str}), {val_str}, dtype={np_dtype})")
                 else:
                     raise ValueError(f"Could not parse shape from result type: {type_str}")
 
@@ -320,7 +340,7 @@ class NumpyTranspiler:
                 self.emit(f"{res} = ({val_str})")
 
             case "ArithmeticDType":
-                val_str = str(val)
+                val_str = val_to_str(val)
                 self.emit(f"{res} = {val_str}")
 
             case _:

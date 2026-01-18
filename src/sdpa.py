@@ -13,7 +13,7 @@ HeadKV = 4
 Dim = 128
 Groups = Head // HeadKV
 
-INF = 1e12
+INF = float("inf")
 
 
 @ct.kernel

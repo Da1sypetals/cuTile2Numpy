@@ -20,8 +20,8 @@ def _serialize_block(block: ir.Block) -> list[dict[str, Any]]:
     """Serialize a Block to a list of operation dictionaries."""
     return {
         "name": block.name,
-        "params":[_serialize_var(v) for v in block.params],
-        "operations":[_serialize_operation(op) for op in block.operations],
+        "params": [_serialize_var(v) for v in block.params],
+        "operations": [_serialize_operation(op) for op in block.operations],
         "loc": _serialize_loc(block.loc),
     }
 
@@ -93,7 +93,18 @@ def _serialize_attributes(attrs: dict[str, Any]) -> dict[str, Any]:
     for k, v in attrs.items():
         if isinstance(v, str):
             result[k] = v
-        elif isinstance(v, (int, float, bool)):
+        elif isinstance(v, float):
+            match str(v):
+                # Handle special floats
+                case "inf":
+                    result[k] = "inf"
+                case "-inf":
+                    result[k] = "-inf"
+                case "nan":
+                    result[k] = "nan"
+                case _:
+                    result[k] = v
+        elif isinstance(v, (int, bool)):
             result[k] = v
         elif isinstance(v, tuple):
             result[k] = list(v)
